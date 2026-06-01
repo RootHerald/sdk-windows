@@ -4,6 +4,7 @@
 
 #include "tbs_key_provider.h"
 #include <cstdio>
+#include "log.h"
 
 namespace RootHerald {
 
@@ -40,14 +41,14 @@ bool TbsKeyProvider::CreateAk()
     // encrypt the seed to PCP_EKPUB and this handle will decrypt it.
     _ekHandle = _tpm.CreateEk();
     if (!_ekHandle) {
-        fprintf(stderr, "[tbs] CreateEk failed\n");
+        RH_LOG_WARN("[tbs] CreateEk failed\n");
         return false;
     }
 
     // AK (transient, restricted RSA signing key under the owner hierarchy).
     _akHandle = _tpm.CreateAndLoadAk(kTpmRhOwner, &_akPubArea);
     if (!_akHandle || _akPubArea.empty()) {
-        fprintf(stderr, "[tbs] CreateAndLoadAk failed\n");
+        RH_LOG_WARN("[tbs] CreateAndLoadAk failed\n");
         FlushTransients();
         return false;
     }
@@ -80,7 +81,7 @@ std::vector<uint8_t> TbsKeyProvider::ActivateCredential(
     const std::vector<uint8_t>& encryptedSecret)
 {
     if (!_akHandle || !_ekHandle) {
-        fprintf(stderr, "[tbs] ActivateCredential called before CreateAk\n");
+        RH_LOG_WARN("[tbs] ActivateCredential called before CreateAk\n");
         return {};
     }
     return _tpm.ActivateCredential(_akHandle, _ekHandle, credentialBlob, encryptedSecret);
@@ -90,7 +91,7 @@ bool TbsKeyProvider::PersistAk()
 {
     if (!_akHandle) return false;
     if (!_tpm.EvictControl(_akHandle, _persistentHandle)) {
-        fprintf(stderr, "[tbs] EvictControl(AK -> 0x%08X) failed\n", _persistentHandle);
+        RH_LOG_WARN("[tbs] EvictControl(AK -> 0x%08X) failed\n", _persistentHandle);
         return false;
     }
     // The persistent copy is now the durable AK; transients are no longer

@@ -15,6 +15,7 @@
 #include "tpm_commands.h"
 #include <cstring>
 #include <algorithm>
+#include "log.h"
 
 #pragma comment(lib, "tbs.lib")
 
@@ -515,12 +516,12 @@ std::vector<uint8_t> TpmCommands::ActivateCredential(
 
         auto policyResp = SendCommand(policyCmd);
         if (policyResp.size() < 10) {
-            fprintf(stderr, "[PolicySecret] Response too short\n");
+            RH_LOG_WARN("[PolicySecret] Response too short\n");
             goto Cleanup;
         }
         uint32_t rc = ReadU32(policyResp.data() + 6);
         if (rc != TPM2_RC_SUCCESS) {
-            fprintf(stderr, "[PolicySecret] TPM error: 0x%08X\n", rc);
+            RH_LOG_WARN("[PolicySecret] TPM error: 0x%08X\n", rc);
             goto Cleanup;
         }
     }
@@ -558,7 +559,7 @@ std::vector<uint8_t> TpmCommands::ActivateCredential(
             // TBS surfaces Windows HRESULTs here; 0x80280400 =
             // TPM_E_COMMAND_BLOCKED means a non-elevated caller hit the TBS
             // user-mode block.
-            fprintf(stderr, "[tbs] ActivateCredential failed: 0x%08X\n", rc);
+            RH_LOG_WARN("[tbs] ActivateCredential failed: 0x%08X\n", rc);
             goto Cleanup;
         }
 
@@ -603,12 +604,12 @@ bool TpmCommands::EvictControl(uint32_t transientHandle, uint32_t persistentHand
 
         auto clearResp = SendCommand(clearCmd);
         if (clearResp.size() < 10) {
-            fprintf(stderr, "[EvictControl] Clear: response too short\n");
+            RH_LOG_WARN("[EvictControl] Clear: response too short\n");
             return false;
         }
         uint32_t rc0 = ReadU32(clearResp.data() + 6);
         if (rc0 != TPM2_RC_SUCCESS) {
-            fprintf(stderr, "[EvictControl] Clear failed: 0x%08X\n", rc0);
+            RH_LOG_WARN("[EvictControl] Clear failed: 0x%08X\n", rc0);
             return false;
         }
     }
@@ -623,12 +624,12 @@ bool TpmCommands::EvictControl(uint32_t transientHandle, uint32_t persistentHand
 
     auto resp = SendCommand(cmd);
     if (resp.size() < 10) {
-        fprintf(stderr, "[EvictControl] Response too short\n");
+        RH_LOG_WARN("[EvictControl] Response too short\n");
         return false;
     }
     uint32_t rc = ReadU32(resp.data() + 6);
     if (rc != TPM2_RC_SUCCESS) {
-        fprintf(stderr, "[EvictControl] TPM error: 0x%08X\n", rc);
+        RH_LOG_WARN("[EvictControl] TPM error: 0x%08X\n", rc);
         return false;
     }
     return true;

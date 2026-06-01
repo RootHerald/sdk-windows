@@ -9,6 +9,7 @@
 #include "tpm_pcp.h"
 #include <winerror.h>
 #include <cstdio>
+#include "log.h"
 
 // PCP provider name
 static const wchar_t* PCP_PROVIDER = L"Microsoft Platform Crypto Provider";
@@ -121,7 +122,7 @@ bool TpmPcp::CreateAk(const wchar_t* keyName)
     SECURITY_STATUS status = NCryptCreatePersistedKey(
         _hProvider, &_hAk, BCRYPT_RSA_ALGORITHM, keyName, 0, 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] NCryptCreatePersistedKey failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] NCryptCreatePersistedKey failed: 0x%08X\n", status);
         return false;
     }
 
@@ -130,7 +131,7 @@ bool TpmPcp::CreateAk(const wchar_t* keyName)
     status = NCryptSetProperty(_hAk, NCRYPT_LENGTH_PROPERTY,
                                (PBYTE)&length, sizeof(length), 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] SetProperty(NCRYPT_LENGTH_PROPERTY) failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] SetProperty(NCRYPT_LENGTH_PROPERTY) failed: 0x%08X\n", status);
         CloseAk();
         return false;
     }
@@ -139,14 +140,14 @@ bool TpmPcp::CreateAk(const wchar_t* keyName)
     status = NCryptSetProperty(_hAk, L"PCP_KEY_USAGE_POLICY",
                                (PBYTE)&usage, sizeof(usage), 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] SetProperty(PCP_KEY_USAGE_POLICY) failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] SetProperty(PCP_KEY_USAGE_POLICY) failed: 0x%08X\n", status);
         CloseAk();
         return false;
     }
 
     status = NCryptFinalizeKey(_hAk, 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] NCryptFinalizeKey failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] NCryptFinalizeKey failed: 0x%08X\n", status);
         CloseAk();
         return false;
     }
@@ -193,14 +194,14 @@ std::vector<uint8_t> TpmPcp::GetAkPublicArea()
     SECURITY_STATUS status = NCryptGetProperty(
         _hAk, L"PCP_TPM12_IDBINDING", nullptr, 0, &cb, 0);
     if (FAILED(status) || cb < 2) {
-        fprintf(stderr, "[pcp] GetProperty(PCP_TPM12_IDBINDING) size failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] GetProperty(PCP_TPM12_IDBINDING) size failed: 0x%08X\n", status);
         return {};
     }
     std::vector<uint8_t> idBinding(cb);
     status = NCryptGetProperty(
         _hAk, L"PCP_TPM12_IDBINDING", idBinding.data(), cb, &cb, 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] GetProperty(PCP_TPM12_IDBINDING) read failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] GetProperty(PCP_TPM12_IDBINDING) read failed: 0x%08X\n", status);
         return {};
     }
 
@@ -208,7 +209,7 @@ std::vector<uint8_t> TpmPcp::GetAkPublicArea()
     if (idBinding.size() < 2) return {};
     uint16_t pubSize = (uint16_t)((idBinding[0] << 8) | idBinding[1]);
     if ((size_t)2 + pubSize > idBinding.size()) {
-        fprintf(stderr, "[pcp] IDBINDING TPM2B_PUBLIC size %u overruns blob %u\n",
+        RH_LOG_WARN("[pcp] IDBINDING TPM2B_PUBLIC size %u overruns blob %u\n",
                 pubSize, (unsigned)idBinding.size());
         return {};
     }
@@ -236,7 +237,7 @@ std::vector<uint8_t> TpmPcp::ActivateCredential(
     SECURITY_STATUS status = NCryptSetProperty(
         _hAk, L"PCP_TPM12_IDACTIVATION", blob.data(), (DWORD)blob.size(), 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] SetProperty(PCP_TPM12_IDACTIVATION) failed: 0x%08X%s\n",
+        RH_LOG_WARN("[pcp] SetProperty(PCP_TPM12_IDACTIVATION) failed: 0x%08X%s\n",
                 status,
                 status == 0x80280400 ? " (TPM_E_COMMAND_BLOCKED)" : "");
         return {};
@@ -245,14 +246,14 @@ std::vector<uint8_t> TpmPcp::ActivateCredential(
     DWORD cb = 0;
     status = NCryptGetProperty(_hAk, L"PCP_TPM12_IDACTIVATION", nullptr, 0, &cb, 0);
     if (FAILED(status) || cb == 0) {
-        fprintf(stderr, "[pcp] GetProperty(PCP_TPM12_IDACTIVATION) size failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] GetProperty(PCP_TPM12_IDACTIVATION) size failed: 0x%08X\n", status);
         return {};
     }
     std::vector<uint8_t> secret(cb);
     status = NCryptGetProperty(_hAk, L"PCP_TPM12_IDACTIVATION",
                                secret.data(), cb, &cb, 0);
     if (FAILED(status)) {
-        fprintf(stderr, "[pcp] GetProperty(PCP_TPM12_IDACTIVATION) read failed: 0x%08X\n", status);
+        RH_LOG_WARN("[pcp] GetProperty(PCP_TPM12_IDACTIVATION) read failed: 0x%08X\n", status);
         return {};
     }
     secret.resize(cb);
@@ -267,7 +268,7 @@ uint32_t TpmPcp::GetAkTpmHandle()
     SECURITY_STATUS status = NCryptGetProperty(
         _hAk, L"PCP_PLATFORMHANDLE", (PBYTE)&handle, sizeof(handle), &cb, 0);
     if (FAILED(status) || cb != sizeof(handle)) {
-        fprintf(stderr, "[pcp] GetProperty(PCP_PLATFORMHANDLE) failed: 0x%08X (cb=%u)\n",
+        RH_LOG_WARN("[pcp] GetProperty(PCP_PLATFORMHANDLE) failed: 0x%08X (cb=%u)\n",
                 status, cb);
         return 0;
     }

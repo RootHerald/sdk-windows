@@ -30,6 +30,7 @@
 #include "http_winhttp.h"
 #include "json_helpers.h"
 #include "win_cert_store_intermediates.h"
+#include "log.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -312,15 +313,15 @@ static bool GatherEkEnrollData(EkEnrollData& out)
 {
     RootHerald::TpmPcp pcp;
     if (!pcp.Open()) {
-        fprintf(stderr, "[enroll] PCP open failed (EK extraction)\n");
+        RH_LOG_WARN("[enroll] PCP open failed (EK extraction)\n");
         return false;
     }
     out.ekPub = pcp.ReadEkPublicKey();
     if (out.ekPub.empty()) {
-        fprintf(stderr, "[enroll] EK pub read failed\n");
+        RH_LOG_WARN("[enroll] EK pub read failed\n");
         return false;
     }
-    fprintf(stderr, "[enroll] EK pub: %zu bytes\n", out.ekPub.size());
+    RH_LOG_WARN("[enroll] EK pub: %zu bytes\n", out.ekPub.size());
 
     // Prefer Windows' cached EK cert (the real vendor-signed cert — works for
     // firmware TPMs that don't surface it via PCP). Fall back to the PCP NV
@@ -328,7 +329,7 @@ static bool GatherEkEnrollData(EkEnrollData& out)
     auto ekCert = ReadEkCertFromWindowsStore();
     if (ekCert.size() <= 32) ekCert = pcp.ReadEkCertificate();
     if (ekCert.size() > 32) {
-        fprintf(stderr, "[enroll] EK cert: %zu bytes\n", ekCert.size());
+        RH_LOG_WARN("[enroll] EK cert: %zu bytes\n", ekCert.size());
         out.ekCertPem = DerToPem(ekCert);
     } else {
         // Firmware TPM (Intel PTT / AMD fTPM): no NV EK cert. Try AMD's AIA
@@ -361,7 +362,7 @@ static bool GatherEkEnrollData(EkEnrollData& out)
         }
         if (out.intermediates.size() > kMaxIntermediates) out.intermediates.resize(kMaxIntermediates);
     }
-    fprintf(stderr, "[enroll] EK cert chain: %zu intermediate(s)\n", out.intermediates.size());
+    RH_LOG_WARN("[enroll] EK cert chain: %zu intermediate(s)\n", out.intermediates.size());
     return true;
 }
 
@@ -382,7 +383,7 @@ static EnrollOutcome RunEnrollFlow(const char* server_url,
     // we never strand a half-enrolled device. ActivateFailed signals the caller
     // to retry under elevation.
     if (provider.RequiresElevationForActivate() && !IsProcessElevated()) {
-        fprintf(stderr, "[enroll:%s] activation needs elevation; process is not elevated\n",
+        RH_LOG_WARN("[enroll:%s] activation needs elevation; process is not elevated\n",
                 provider.ModeName());
         return EnrollOutcome::ActivateFailed;
     }
@@ -391,20 +392,20 @@ static EnrollOutcome RunEnrollFlow(const char* server_url,
     if (!GatherEkEnrollData(ek)) return EnrollOutcome::EnrollFailed;
 
     if (!provider.Open()) {
-        fprintf(stderr, "[enroll:%s] provider open failed\n", provider.ModeName());
+        RH_LOG_WARN("[enroll:%s] provider open failed\n", provider.ModeName());
         return EnrollOutcome::EnrollFailed;
     }
     if (!provider.CreateAk()) {
-        fprintf(stderr, "[enroll:%s] CreateAk failed\n", provider.ModeName());
+        RH_LOG_WARN("[enroll:%s] CreateAk failed\n", provider.ModeName());
         return EnrollOutcome::EnrollFailed;
     }
     auto akPub = provider.GetAkPublicArea();
     if (akPub.empty()) {
-        fprintf(stderr, "[enroll:%s] GetAkPublicArea failed\n", provider.ModeName());
+        RH_LOG_WARN("[enroll:%s] GetAkPublicArea failed\n", provider.ModeName());
         provider.DeleteAk();
         return EnrollOutcome::EnrollFailed;
     }
-    fprintf(stderr, "[enroll:%s] AK created, pub area %zu bytes\n", provider.ModeName(), akPub.size());
+    RH_LOG_WARN("[enroll:%s] AK created, pub area %zu bytes\n", provider.ModeName(), akPub.size());
 
     // POST /enroll
     std::map<std::string, std::string> fields = {
@@ -427,7 +428,7 @@ static EnrollOutcome RunEnrollFlow(const char* server_url,
     }
     std::string url = std::string(server_url) + "/api/v1/devices/enroll";
     auto resp = RootHerald::HttpPost(url, RootHerald::JsonBuild(fields));
-    fprintf(stderr, "[enroll:%s] enroll response: %d\n", provider.ModeName(), resp.statusCode);
+    RH_LOG_WARN("[enroll:%s] enroll response: %d\n", provider.ModeName(), resp.statusCode);
 
     if (resp.statusCode == 409) {
         auto did = RootHerald::JsonGet(resp.body, "deviceId");
@@ -446,11 +447,11 @@ static EnrollOutcome RunEnrollFlow(const char* server_url,
     // Credential activation — the mode-defining step.
     auto secret = provider.ActivateCredential(Base64Decode(credBlob), Base64Decode(encSecret));
     if (secret.empty()) {
-        fprintf(stderr, "[enroll:%s] ActivateCredential failed\n", provider.ModeName());
+        RH_LOG_WARN("[enroll:%s] ActivateCredential failed\n", provider.ModeName());
         provider.DeleteAk();
         return EnrollOutcome::ActivateFailed;
     }
-    fprintf(stderr, "[enroll:%s] ActivateCredential OK (%zu bytes)\n", provider.ModeName(), secret.size());
+    RH_LOG_WARN("[enroll:%s] ActivateCredential OK (%zu bytes)\n", provider.ModeName(), secret.size());
 
     // POST /activate
     std::string activateBody = RootHerald::JsonBuild({
@@ -459,18 +460,18 @@ static EnrollOutcome RunEnrollFlow(const char* server_url,
     });
     auto actResp = RootHerald::HttpPost(std::string(server_url) + "/api/v1/devices/activate", activateBody);
     if (actResp.statusCode != 200) {
-        fprintf(stderr, "[enroll:%s] activate POST failed: %d\n", provider.ModeName(), actResp.statusCode);
+        RH_LOG_WARN("[enroll:%s] activate POST failed: %d\n", provider.ModeName(), actResp.statusCode);
         provider.DeleteAk();
         return EnrollOutcome::EnrollFailed;
     }
 
     if (!provider.PersistAk()) {
-        fprintf(stderr, "[enroll:%s] PersistAk failed\n", provider.ModeName());
+        RH_LOG_WARN("[enroll:%s] PersistAk failed\n", provider.ModeName());
         return EnrollOutcome::EnrollFailed;
     }
 
     outDeviceId = deviceId;
-    fprintf(stderr, "[enroll:%s] complete (deviceId=%s)\n", provider.ModeName(), deviceId.c_str());
+    RH_LOG_WARN("[enroll:%s] complete (deviceId=%s)\n", provider.ModeName(), deviceId.c_str());
     return EnrollOutcome::Ok;
 }
 
@@ -493,7 +494,7 @@ extern "C" ROOTHERALD_API int RootHeraldRunElevatedEstablishKey(
     // instead. The elevation *attempt* lives in the public RootHeraldEnroll
     // path, not in this already-spawned worker.
     if (!IsProcessElevated()) {
-        fprintf(stderr, "[establish-key] must run elevated; refusing raw-TBS activation\n");
+        RH_LOG_WARN("[establish-key] must run elevated; refusing raw-TBS activation\n");
         return 1;
     }
 
@@ -501,7 +502,7 @@ extern "C" ROOTHERALD_API int RootHeraldRunElevatedEstablishKey(
     std::string deviceId;
     auto outcome = RunEnrollFlow(server_url, tbs, deviceId);
     if (outcome != EnrollOutcome::Ok) {
-        fprintf(stderr, "[establish-key] TBS enrollment failed (outcome=%d)\n", (int)outcome);
+        RH_LOG_WARN("[establish-key] TBS enrollment failed (outcome=%d)\n", (int)outcome);
         return 1;
     }
     WriteCachedMethod(ActivationMethod::Tbs);
@@ -546,7 +547,7 @@ static bool SpawnElevatedEstablishKey(const char* server_url, std::string& outDe
     sei.lpParameters = args.c_str();
     sei.nShow = SW_HIDE;
     if (!ShellExecuteExW(&sei) || !sei.hProcess) {
-        fprintf(stderr, "[establish-key] elevation launch failed/declined (err=%lu)\n", GetLastError());
+        RH_LOG_WARN("[establish-key] elevation launch failed/declined (err=%lu)\n", GetLastError());
         return false;
     }
     WaitForSingleObject(sei.hProcess, INFINITE);
@@ -554,7 +555,7 @@ static bool SpawnElevatedEstablishKey(const char* server_url, std::string& outDe
     GetExitCodeProcess(sei.hProcess, &exitCode);
     CloseHandle(sei.hProcess);
     if (exitCode != 0) {
-        fprintf(stderr, "[establish-key] elevated child failed (exit=%lu)\n", exitCode);
+        RH_LOG_WARN("[establish-key] elevated child failed (exit=%lu)\n", exitCode);
         return false;
     }
 
@@ -608,7 +609,7 @@ RootHeraldResult RootHeraldEnroll(
 
     // Already enrolled (and not rotating): bail.
     if (!force_reenroll && AnyAkPresent(cached)) {
-        fprintf(stderr, "[enroll] already enrolled via %s; use force_reenroll=1 to rotate\n",
+        RH_LOG_WARN("[enroll] already enrolled via %s; use force_reenroll=1 to rotate\n",
                 cached == ActivationMethod::Tbs ? "tbs" : "pcp");
         return RH_PROTO_ERR_ALREADY_ENROLLED;
     }
@@ -634,7 +635,7 @@ RootHeraldResult RootHeraldEnroll(
         }
         // ActivateFailed: PCP needs elevation on this firmware. Clean up the
         // orphaned PCP key and fall through to the elevated TBS path.
-        fprintf(stderr, "[enroll] PCP activation needs elevation; falling back to elevated TBS\n");
+        RH_LOG_WARN("[enroll] PCP activation needs elevation; falling back to elevated TBS\n");
         pcp.DeleteAk();
     }
 
@@ -698,16 +699,16 @@ RootHeraldResult RootHeraldAttest(
     //    retry) instead of a hard failure.
     auto provider = SelectEnrolledProvider();
     if (!provider) {
-        fprintf(stderr, "[attest] no enrolled AK on any backend -- not enrolled\n");
+        RH_LOG_WARN("[attest] no enrolled AK on any backend -- not enrolled\n");
         strncpy_s(out_info->session_id, session_id, _TRUNCATE);
         strncpy_s(out_info->status, "failed", _TRUNCATE);
         strncpy_s(out_info->failure_reason, "Not enrolled", _TRUNCATE);
         return RH_PROTO_ERR_NOT_ENROLLED;
     }
-    fprintf(stderr, "[attest] using %s backend\n", provider->ModeName());
+    RH_LOG_WARN("[attest] using %s backend\n", provider->ModeName());
     uint32_t akHandle = provider->GetQuoteHandle();
     if (!akHandle) {
-        fprintf(stderr, "[attest] could not resolve AK quote handle (mode=%s)\n", provider->ModeName());
+        RH_LOG_WARN("[attest] could not resolve AK quote handle (mode=%s)\n", provider->ModeName());
         strncpy_s(out_info->session_id, session_id, _TRUNCATE);
         strncpy_s(out_info->status, "failed", _TRUNCATE);
         strncpy_s(out_info->failure_reason, "AK handle unavailable", _TRUNCATE);
@@ -734,7 +735,7 @@ RootHeraldResult RootHeraldAttest(
     for (uint32_t idx : pcrs) {
         auto pcrVal = tpmCmd.PcrRead(idx);
         if (pcrVal.empty()) {
-            fprintf(stderr, "[attest] PcrRead(%u) failed -- aborting\n", idx);
+            RH_LOG_WARN("[attest] PcrRead(%u) failed -- aborting\n", idx);
             strncpy_s(out_info->session_id, session_id, _TRUNCATE);
             strncpy_s(out_info->status, "failed", _TRUNCATE);
             strncpy_s(out_info->failure_reason, "PCR read failed", _TRUNCATE);
@@ -749,7 +750,7 @@ RootHeraldResult RootHeraldAttest(
     // 4. TPM2_Quote against the loaded AK.
     std::vector<uint8_t> quoted, signature;
     if (!tpmCmd.Quote(akHandle, nonce, pcrs, quoted, signature)) {
-        fprintf(stderr, "[attest] TPM2_Quote failed\n");
+        RH_LOG_WARN("[attest] TPM2_Quote failed\n");
         strncpy_s(out_info->session_id, session_id, _TRUNCATE);
         strncpy_s(out_info->status, "failed", _TRUNCATE);
         strncpy_s(out_info->failure_reason, "Quote failed", _TRUNCATE);
@@ -836,7 +837,7 @@ RootHeraldResult RootHeraldAttest(
     if (!g_linkToken.empty()) { bodyFields["linkToken"] = g_linkToken; g_linkToken.clear(); }
     auto resp = RootHerald::HttpPost(std::string(server_url) + "/api/v1/attest",
                                      RootHerald::JsonBuild(bodyFields));
-    fprintf(stderr, "[attest] Response: %d, body: %.300s\n", resp.statusCode, resp.body.c_str());
+    RH_LOG_WARN("[attest] Response: %d, body: %.300s\n", resp.statusCode, resp.body.c_str());
     if (resp.statusCode != 200)
         return RH_PROTO_ERR_ATTESTATION_FAILED;
 

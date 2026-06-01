@@ -7,6 +7,7 @@
 
 #include "amd_aia_fetch.h"
 #include "http_winhttp.h"
+#include "log.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -102,17 +103,17 @@ std::vector<uint8_t> FetchAmdAiaEkCert(const std::vector<uint8_t>& ekPubModulus)
 
     uint8_t digest[32] = {};
     if (!Sha256(ekPubModulus.data(), ekPubModulus.size(), digest)) {
-        fprintf(stderr, "[amd-aia] SHA-256 of modulus failed\n");
+        RH_LOG_WARN("[amd-aia] SHA-256 of modulus failed\n");
         return {};
     }
 
     std::string hex = HexLower(digest, sizeof(digest));
     std::string url = "https://ftpm.amd.com/pki/aia/" + hex;
 
-    fprintf(stderr, "[amd-aia] GET %s\n", url.c_str());
+    RH_LOG_WARN("[amd-aia] GET %s\n", url.c_str());
     HttpResponse resp = HttpGet(url);
     if (resp.statusCode != 200) {
-        fprintf(stderr, "[amd-aia] HTTP %d (body=%zu bytes)\n",
+        RH_LOG_WARN("[amd-aia] HTTP %d (body=%zu bytes)\n",
                 resp.statusCode, resp.body.size());
         return {};
     }
