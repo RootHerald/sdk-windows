@@ -163,14 +163,34 @@ static std::vector<uint8_t> Sha1(const uint8_t* data, size_t len)
 //   fingerprint = SHA-256(ekPublicKey)              (firmware TPM, no EK cert)
 //   id16        = SHA-1(namespace || fingerprint)[:16], v5 + RFC4122 variant
 //   string      = .NET Guid formatting (first three groups byte-swapped)
-static std::string ComputeDeviceIdFromEk(const std::vector<uint8_t>& ekPub)
+static std::string ComputeDeviceIdFromFingerprint(const std::vector<uint8_t>& fingerprint);
+
+// Forward declaration — defined with the enroll helpers below.
+static std::vector<uint8_t> ReadEkCertFromWindowsStore();
+
+// Derive the deviceId exactly as the server does (DeviceController.Enroll):
+// fingerprint = SHA-256(EK certificate DER) when the device has an EK cert,
+// else SHA-256(EK public key). Getting this wrong silently breaks unbound-
+// session self-binding — the server looks the id up and finds nothing.
+static std::string DeriveLocalDeviceId()
 {
+    auto ekCertDer = ReadEkCertFromWindowsStore();
+    if (ekCertDer.size() > 32)
+        return ComputeDeviceIdFromFingerprint(Sha256(ekCertDer));
+
+    RootHerald::TpmPcp ekProv;
+    if (!ekProv.Open()) return {};
+    auto ekPub = ekProv.ReadEkPublicKey();
     if (ekPub.empty()) return {};
+    return ComputeDeviceIdFromFingerprint(Sha256(ekPub));
+}
+
+static std::string ComputeDeviceIdFromFingerprint(const std::vector<uint8_t>& fingerprint)
+{
     static const uint8_t kNamespace[16] = {
         0x52, 0x6F, 0x6F, 0x74, 0x48, 0x65, 0x72, 0x61,
         0x6C, 0x64, 0x44, 0x65, 0x76, 0x49, 0x44, 0x76,
     };
-    auto fingerprint = Sha256(ekPub);
     if (fingerprint.size() != 32) return {};
 
     std::vector<uint8_t> input;
@@ -828,18 +848,24 @@ RootHeraldResult RootHeraldAttest(
     // (DeviceId left null at challenge time) resolves to this device — the
     // server recomputes the same id from the stored EK fingerprint.
     std::string deviceId = g_deviceId;
-    if (deviceId.empty()) {
-        RootHerald::TpmPcp ekProv;
-        if (ekProv.Open())
-            deviceId = ComputeDeviceIdFromEk(ekProv.ReadEkPublicKey());
-    }
+    if (deviceId.empty()) deviceId = DeriveLocalDeviceId();
     if (!deviceId.empty()) bodyFields["deviceId"] = deviceId;
     if (!g_linkToken.empty()) { bodyFields["linkToken"] = g_linkToken; g_linkToken.clear(); }
     auto resp = RootHerald::HttpPost(std::string(server_url) + "/api/v1/attest",
                                      RootHerald::JsonBuild(bodyFields));
     RH_LOG_WARN("[attest] Response: %d, body: %.300s\n", resp.statusCode, resp.body.c_str());
-    if (resp.statusCode != 200)
+    if (resp.statusCode != 200) {
+        // Surface the server's machine-readable error code (e.g.
+        // "session_unbound") so callers can branch on it — the prose
+        // error_description is for humans and may change.
+        auto errCode = RootHerald::JsonGet(resp.body, "error");
+        strncpy_s(out_info->session_id, session_id, _TRUNCATE);
+        strncpy_s(out_info->status, "failed", _TRUNCATE);
+        strncpy_s(out_info->failure_reason,
+                  !errCode.empty() ? errCode.c_str() : "server rejected attestation",
+                  _TRUNCATE);
         return RH_PROTO_ERR_ATTESTATION_FAILED;
+    }
 
     // 7. Parse response.
     auto status = RootHerald::JsonGet(resp.body, "status");
@@ -883,20 +909,16 @@ RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status)
     out_status->is_enrolled = enrolled ? 1 : 0;
 
     // Populate device_id when we have a TPM. The deviceId is a deterministic
-    // hash over the EK pubkey, so we can compute it from the live TPM without
-    // having performed an enroll. This matches the API contract — the
-    // RootHeraldDeviceStatus struct declares device_id, so callers expect
-    // it to be populated when has_tpm=1.
+    // hash over the EK identity (cert when present, else pubkey — mirroring
+    // the server's derivation), so we can compute it from the live TPM
+    // without having performed an enroll. This matches the API contract —
+    // the RootHeraldDeviceStatus struct declares device_id, so callers
+    // expect it to be populated when has_tpm=1.
     if (out_status->has_tpm) {
         try {
-            RootHerald::TpmPcp ekProv;
-            if (ekProv.Open()) {
-                auto ekPub = ekProv.ReadEkPublicKey();
-                if (!ekPub.empty()) {
-                    auto did = ComputeDeviceIdFromEk(ekPub);
-                    strncpy_s(out_status->device_id, did.c_str(), _TRUNCATE);
-                }
-            }
+            auto did = DeriveLocalDeviceId();
+            if (!did.empty())
+                strncpy_s(out_status->device_id, did.c_str(), _TRUNCATE);
         } catch (...) {
             // Best-effort — leave device_id empty rather than fail the status call.
         }

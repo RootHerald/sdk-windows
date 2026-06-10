@@ -321,6 +321,29 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_AttestSession(
     auto result = RootHeraldAttest(impl->endpoint.c_str(), session_id,
                                    nonce_b64, std::strlen(nonce_b64), &attest);
 
+    // Self-heal the "locally enrolled, server doesn't know us" split-brain:
+    // the TPM holds a persistent AK (so Enroll short-circuits locally) but
+    // the server has no Device row (fresh database, pruned device, restored
+    // backup), so it rejects the session with `session_unbound`. A forced
+    // re-enrollment runs the full server ceremony and recreates the row —
+    // the deviceId is EK-derived, so the device keeps its identity. Retry
+    // exactly once; a second rejection is surfaced verbatim.
+    if (result == RH_PROTO_ERR_ATTESTATION_FAILED &&
+        std::strcmp(attest.failure_reason, "session_unbound") == 0)
+    {
+        RootHeraldEnrollmentInfo recover = {};
+        auto enrollResult = RootHeraldEnroll(impl->endpoint.c_str(),
+                                             /*force_reenroll=*/1, &recover);
+        if (enrollResult == RH_PROTO_OK)
+        {
+            impl->deviceId = recover.device_id;
+            RootHeraldSetDeviceId(impl->deviceId.c_str());
+            attest = {};
+            result = RootHeraldAttest(impl->endpoint.c_str(), session_id,
+                                      nonce_b64, std::strlen(nonce_b64), &attest);
+        }
+    }
+
     CopyString(out_result->session_id, sizeof(out_result->session_id), attest.session_id);
     CopyString(out_result->status, sizeof(out_result->status), attest.status);
     CopyString(out_result->authorization_code, sizeof(out_result->authorization_code),
