@@ -14,9 +14,20 @@
 
 namespace RootHerald {
 
+// Tenant publishable key attached to JSON POSTs as X-RootHerald-Site-Key.
+// Empty (the default) = no header. Set by the public-ABI facade only; see
+// SetSiteKeyForRequests in http_winhttp.h.
+static std::string g_siteKey;
+
+void SetSiteKeyForRequests(const std::string& siteKey)
+{
+    g_siteKey = siteKey;
+}
+
 static HttpResponse DoRequest(const std::string& url, const std::string& verb,
                                const std::string& body,
-                               const wchar_t* contentTypeHeader = L"Content-Type: application/json")
+                               const wchar_t* contentTypeHeader = L"Content-Type: application/json",
+                               bool attachSiteKey = false)
 {
     HttpResponse response;
 
@@ -83,6 +94,15 @@ static HttpResponse DoRequest(const std::string& url, const std::string& verb,
     // Set Content-Type header
     WinHttpAddRequestHeaders(hRequest, contentTypeHeader, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
 
+    // Optional tenant attribution header (omitted when no site key is set).
+    if (attachSiteKey && !g_siteKey.empty()) {
+        std::string header = "X-RootHerald-Site-Key: " + g_siteKey;
+        int headerWideLen = MultiByteToWideChar(CP_UTF8, 0, header.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> wideHeader(headerWideLen);
+        MultiByteToWideChar(CP_UTF8, 0, header.c_str(), -1, wideHeader.data(), headerWideLen);
+        WinHttpAddRequestHeaders(hRequest, wideHeader.data(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+    }
+
     // Send
     BOOL result;
     if (!body.empty()) {
@@ -142,7 +162,8 @@ static HttpResponse DoRequest(const std::string& url, const std::string& verb,
 
 HttpResponse HttpPost(const std::string& url, const std::string& jsonBody)
 {
-    return DoRequest(url, "POST", jsonBody);
+    return DoRequest(url, "POST", jsonBody,
+                     L"Content-Type: application/json", /*attachSiteKey=*/true);
 }
 
 HttpResponse HttpPostForm(const std::string& url, const std::string& formBody)
