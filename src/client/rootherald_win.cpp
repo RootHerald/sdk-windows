@@ -18,6 +18,7 @@
  */
 
 #include "rootherald_win.h"
+#include "rootherald.h"
 #include "tpm_pcp.h"
 #include "tpm_commands.h"
 #include "attestation_key_provider.h"
@@ -923,5 +924,91 @@ RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status)
             // Best-effort — leave device_id empty rather than fail the status call.
         }
     }
+    return RH_PROTO_OK;
+}
+
+// LOCAL-ONLY posture snapshot for RootHeraldClient_CollectPosture (contract
+// C5, ABI 1.2). Reuses the same internals the status / attest flows already
+// exercise — TPM probe, AK presence, EK cert store, deviceId derivation, and
+// the TCG event log + Secure Boot chain analysis — and NEVER touches the
+// network. detail_json mirrors the secureBootChain fields the attest flow
+// serializes, minus anything network-derived.
+extern "C" RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture)
+{
+    if (!out_posture)
+        return RH_PROTO_ERR_INVALID_PARAM;
+    memset(out_posture, 0, sizeof(RootHeraldPosture));
+
+    // Event-log-derived signals default to "undetermined"/"unavailable".
+    out_posture->secure_boot = -1;
+    out_posture->oem_keyed = -1;
+    out_posture->boot_log_measurements = -1;
+    out_posture->boot_log_revoked = -1;
+
+    // TPM reachability (same probe as RootHeraldGetStatus).
+    RootHerald::TpmPcp pcp;
+    out_posture->has_tpm = pcp.IsAvailable() ? 1 : 0;
+
+    // Local enrollment: an AK persisted on either backend (cached-method
+    // first, then both — same probing logic GetStatus uses).
+    ActivationMethod cached = ReadCachedMethod();
+    bool enrolled = AnyAkPresent(cached);
+    if (!enrolled && cached == ActivationMethod::Unknown) {
+        enrolled = AnyAkPresent(ActivationMethod::Pcp) || AnyAkPresent(ActivationMethod::Tbs);
+    }
+    out_posture->is_enrolled = enrolled ? 1 : 0;
+
+    // Vendor EK certificate cached by Windows during TPM provisioning.
+    auto ekCertDer = ReadEkCertFromWindowsStore();
+    out_posture->ek_cert_present = (ekCertDer.size() > 32) ? 1 : 0;
+
+    // Deterministic local device id (cert-first, mirroring the server's
+    // derivation). Best-effort — leave empty rather than fail the call.
+    if (out_posture->has_tpm) {
+        try {
+            auto did = DeriveLocalDeviceId();
+            if (!did.empty())
+                strncpy_s(out_posture->device_id, did.c_str(), _TRUNCATE);
+        } catch (...) {
+        }
+    }
+
+    // Measured-boot signals from the TCG event log. An empty/unreadable log
+    // leaves the -1 "undetermined" defaults in place.
+    std::map<std::string, std::string> detail = {
+        {"hasTpm",        out_posture->has_tpm ? "true" : "false"},
+        {"isEnrolled",    out_posture->is_enrolled ? "true" : "false"},
+        {"ekCertPresent", out_posture->ek_cert_present ? "true" : "false"},
+        {"deviceId",      out_posture->device_id},
+        {"platform",      "windows"}
+    };
+
+    auto eventLog = RootHerald::ReadEventLog();
+    if (!eventLog.empty()) {
+        auto chainReport = RootHerald::ValidateSecureBootChain(eventLog);
+        auto eventAnalysis = RootHerald::ParseAndAnalyzeEventLog(eventLog);
+
+        out_posture->secure_boot = chainReport.secureBootEnabled ? 1 : 0;
+        out_posture->oem_keyed = chainReport.pkIsKnownOem ? 1 : 0;
+        strncpy_s(out_posture->oem_name, chainReport.pkOemName.c_str(), _TRUNCATE);
+        out_posture->boot_log_measurements = (int)eventAnalysis.entries.size();
+        out_posture->boot_log_revoked = eventAnalysis.revokedCount;
+
+        detail["secureBootEnabled"] = chainReport.secureBootEnabled ? "true" : "false";
+        detail["pkIsKnownOem"]      = chainReport.pkIsKnownOem ? "true" : "false";
+        detail["pkOemName"]         = chainReport.pkOemName;
+        detail["kekHasMicrosoft"]   = chainReport.kekHasMicrosoft ? "true" : "false";
+        detail["dbxHashCount"]      = std::to_string(chainReport.dbxHashCount);
+        detail["totalMeasurements"] = std::to_string(eventAnalysis.entries.size());
+        detail["verifiedCount"]     = std::to_string(eventAnalysis.verifiedCount);
+        detail["unknownCount"]      = std::to_string(eventAnalysis.unknownCount);
+        detail["revokedCount"]      = std::to_string(eventAnalysis.revokedCount);
+        detail["verdict"]           = chainReport.verdict;
+    } else {
+        detail["eventLog"] = "unavailable";
+    }
+
+    auto detailJson = RootHerald::JsonBuild(detail);
+    strncpy_s(out_posture->detail_json, detailJson.c_str(), _TRUNCATE);
     return RH_PROTO_OK;
 }

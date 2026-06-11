@@ -28,6 +28,7 @@ extern "C" RootHeraldResult RootHeraldAttest(const char* server_url, const char*
                                              const char* nonce_b64, size_t nonce_len,
                                              RootHeraldAttestationInfo* out_info);
 extern "C" RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status);
+extern "C" RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture);
 extern "C" void RootHeraldSetLinkToken(const char* link_token);
 extern "C" void RootHeraldSetDeviceId(const char* device_id);
 extern "C" int RootHeraldRunElevatedEstablishKey(const char* server_url,
@@ -35,7 +36,7 @@ extern "C" int RootHeraldRunElevatedEstablishKey(const char* server_url,
 
 namespace {
 
-constexpr const char* kAbiVersion = "1.1";
+constexpr const char* kAbiVersion = "1.2";
 constexpr const char* kLibraryVersion = "0.2.0";  // bumped when public ABI stabilises
 constexpr const char* kDefaultEndpoint = "https://rootherald.io";
 
@@ -130,6 +131,23 @@ void FillMockDeviceInfo(RootHeraldDeviceInfo* out)
     CopyString(out->device_id, sizeof(out->device_id),
                "00000000-0000-4000-8000-000000000mock");
     CopyString(out->platform_name, sizeof(out->platform_name), "windows");
+}
+
+// Canned all-green posture for mock-TPM mode — same convention as the other
+// FillMock* helpers: never touch real hardware, never hit the network.
+void FillMockPosture(RootHeraldPosture* out)
+{
+    out->has_tpm = 1;
+    out->is_enrolled = 1;
+    out->ek_cert_present = 1;
+    out->secure_boot = 1;
+    out->oem_keyed = 1;
+    CopyString(out->oem_name, sizeof(out->oem_name), "MockOEM");
+    out->boot_log_measurements = 42;
+    out->boot_log_revoked = 0;
+    CopyString(out->device_id, sizeof(out->device_id),
+               "00000000-0000-4000-8000-000000000mock");
+    CopyString(out->detail_json, sizeof(out->detail_json), "{\"mock\":true}");
 }
 
 } // namespace
@@ -388,6 +406,26 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_GetDeviceInfo(
     CopyString(out_result->device_id, sizeof(out_result->device_id), status.device_id);
     CopyString(out_result->platform_name, sizeof(out_result->platform_name), status.platform);
     return MapRootHeraldStatus(result);
+}
+
+extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
+    RootHeraldClient* client, RootHeraldPosture* out_result)
+{
+    if (client == nullptr || out_result == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
+    std::memset(out_result, 0, sizeof(*out_result));
+
+    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
+    std::lock_guard<std::mutex> g(impl->lock);
+
+    if (impl->mockTpm)
+    {
+        FillMockPosture(out_result);
+        return ROOTHERALD_OK;
+    }
+
+    // LOCAL-ONLY: never touches the network, so no site key is installed.
+    // Readiness signals, not a verdict — the verdict is always server-side.
+    return MapRootHeraldStatus(RootHeraldCollectLocalPosture(out_result));
 }
 
 extern "C" ROOTHERALD_API int RootHerald_RunElevatedEstablishKey(
