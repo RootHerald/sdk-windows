@@ -1,10 +1,15 @@
 /**
  * Root Herald — public C ABI implementation (Windows).
  *
- * The public ABI is declared in src/clients/common/rootherald.h. This file
- * is the thin facade layer that maps the public RootHeraldClient_* entry
- * points onto the internal rootherald_win infrastructure (TPM enroll +
- * Quote + secure-boot collection + AIA fetch + WinHTTP transport).
+ * The public ABI is declared in common/rootherald.h. This file is the thin
+ * facade layer that maps the public RootHeraldClient_* entry points onto the
+ * internal rootherald_win infrastructure (keyless TPM enroll begin/complete +
+ * Quote + secure-boot collection + AIA fetch).
+ *
+ * ABI 3.0: the client is KEYLESS and opens NO socket to RootHerald. Create takes
+ * no api_key / endpoint; enrollment is the two-leg blob-emitting handshake
+ * EnrollBegin/EnrollComplete; per-attestation evidence is CollectEvidence. All
+ * RootHerald network I/O lives in the embedder's backend, not here.
  *
  * Wave 6: the library is static — no DLL export decoration is required.
  * The ROOTHERALD_API macro in <rootherald.h> resolves to an empty token,
@@ -13,39 +18,32 @@
 
 #include "rootherald.h"
 #include "protocol.h"
-#include "http_winhttp.h"
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <memory>
 #include <mutex>
 
-// Forward-declare the legacy entry points from rootherald_win.cpp.
-extern "C" RootHeraldResult RootHeraldEnroll(const char* server_url, int force_reenroll,
-                                             RootHeraldEnrollmentInfo* out_info);
-extern "C" RootHeraldResult RootHeraldAttest(const char* server_url, const char* session_id,
-                                             const char* nonce_b64, size_t nonce_len,
-                                             RootHeraldAttestationInfo* out_info);
+// Forward-declare the internal (keyless) entry points from rootherald_win.cpp.
+extern "C" RootHeraldResult RootHeraldEnrollBegin(char** out_enroll_json);
+extern "C" RootHeraldResult RootHeraldEnrollComplete(const char* challenge_json,
+                                                     char** out_activate_json);
 extern "C" RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status);
 extern "C" RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture);
-extern "C" void RootHeraldSetLinkToken(const char* link_token);
-extern "C" void RootHeraldSetDeviceId(const char* device_id);
-extern "C" int RootHeraldRunElevatedEstablishKey(const char* server_url,
-                                                 const char* result_path);
+extern "C" RootHeraldResult RootHeraldCollectEvidence(const char* nonce_b64,
+                                                      char** out_evidence_json);
+extern "C" void RootHeraldFreeEvidence(char* evidence_json);
 
 namespace {
 
-constexpr const char* kAbiVersion = "1.2";
+constexpr const char* kAbiVersion = "3.0";
 constexpr const char* kLibraryVersion = "0.2.0";  // bumped when public ABI stabilises
-constexpr const char* kDefaultEndpoint = "https://rootherald.io";
 
 struct RootHeraldClientImpl
 {
-    std::string apiKey;
-    std::string endpoint;
     std::string applicationId;
-    std::string deviceId;
     bool mockTpm = false;
     std::mutex lock;
 };
@@ -71,57 +69,20 @@ RootHeraldStatus MapRootHeraldStatus(RootHeraldResult r)
     case RH_PROTO_ERR_NOT_ENROLLED: return ROOTHERALD_ERR_NOT_ENROLLED;
     case RH_PROTO_ERR_INVALID_PARAM: return ROOTHERALD_ERR_INVALID_ARG;
     case RH_PROTO_ERR_ALREADY_ENROLLED: return ROOTHERALD_OK; // already-enrolled is benign
+    case RH_PROTO_ERR_ELEVATION_REQUIRED: return ROOTHERALD_ERR_ELEVATION_REQUIRED;
     default: return ROOTHERALD_ERR_INTERNAL;
     }
 }
 
-// RAII: install the handle's publishable key as the X-RootHerald-Site-Key
-// header for the duration of a legacy-layer call, then clear it so direct
-// legacy-global consumers keep sending no header. Constructed under the
-// handle's lock, which serialises access to the transport-level state.
-struct ScopedSiteKey
+// Emit a heap-allocated copy of `json` (malloc'd so the caller frees it with
+// RootHeraldClient_FreeEvidence — which is free()). Used by the mock paths.
+RootHeraldStatus EmitHeapJson(const std::string& json, char** out)
 {
-    explicit ScopedSiteKey(const std::string& key)
-    {
-        RootHerald::SetSiteKeyForRequests(key);
-    }
-    ~ScopedSiteKey()
-    {
-        RootHerald::SetSiteKeyForRequests(std::string());
-    }
-    ScopedSiteKey(const ScopedSiteKey&) = delete;
-    ScopedSiteKey& operator=(const ScopedSiteKey&) = delete;
-};
-
-// Canned mock evidence used when --mock-tpm is enabled. Documented in the
-// public header: this path must never be reachable in production.
-void FillMockResult(RootHeraldVerifyResult* out)
-{
-    out->verdict = ROOTHERALD_VERDICT_ALLOW;
-    CopyString(out->device_id, sizeof(out->device_id),
-               "00000000-0000-4000-8000-000000000mock");
-    CopyString(out->tpm_class, sizeof(out->tpm_class), "discrete-tpm");
-    CopyString(out->posture_json, sizeof(out->posture_json),
-               "{\"mock\":true,\"secure_boot\":true,\"tpm_class\":\"discrete-tpm\"}");
-    CopyString(out->reason, sizeof(out->reason), "mock-tpm mode");
-}
-
-// Canned session-flow results for mock-TPM mode — same convention as
-// FillMockResult: never touch real TPM hardware, never hit the network.
-void FillMockEnrollResult(RootHeraldEnrollResult* out)
-{
-    CopyString(out->device_id, sizeof(out->device_id),
-               "00000000-0000-4000-8000-000000000mock");
-}
-
-void FillMockAttestResult(const char* session_id, RootHeraldAttestResult* out)
-{
-    CopyString(out->session_id, sizeof(out->session_id), session_id);
-    CopyString(out->status, sizeof(out->status), "verified");
-    CopyString(out->authorization_code, sizeof(out->authorization_code),
-               "mock-authorization-code");
-    CopyString(out->redirect_uri, sizeof(out->redirect_uri), "");
-    CopyString(out->reason, sizeof(out->reason), "mock-tpm mode");
+    char* buf = (char*)malloc(json.size() + 1);
+    if (!buf) return ROOTHERALD_ERR_INTERNAL;
+    std::memcpy(buf, json.c_str(), json.size() + 1);
+    *out = buf;
+    return ROOTHERALD_OK;
 }
 
 void FillMockDeviceInfo(RootHeraldDeviceInfo* out)
@@ -156,29 +117,15 @@ void FillMockPosture(RootHeraldPosture* out)
 // Public ABI implementation
 // ------------------------------------------------------------------
 
-extern "C" ROOTHERALD_API RootHeraldClient* RootHeraldClient_Create(
-    const char* api_key, const char* endpoint)
+extern "C" ROOTHERALD_API RootHeraldClient* RootHeraldClient_Create(void)
 {
-    if (api_key == nullptr || api_key[0] == '\0') return nullptr;
     auto impl = std::make_unique<RootHeraldClientImpl>();
-    impl->apiKey = api_key;
-    impl->endpoint = (endpoint != nullptr && endpoint[0] != '\0') ? endpoint : kDefaultEndpoint;
     return reinterpret_cast<RootHeraldClient*>(impl.release());
 }
 
 extern "C" ROOTHERALD_API void RootHeraldClient_Destroy(RootHeraldClient* client)
 {
     delete reinterpret_cast<RootHeraldClientImpl*>(client);
-}
-
-extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetEndpoint(
-    RootHeraldClient* client, const char* endpoint)
-{
-    if (client == nullptr || endpoint == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-    impl->endpoint = endpoint;
-    return ROOTHERALD_OK;
 }
 
 extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetApplicationId(
@@ -201,186 +148,53 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetMockTpm(
     return ROOTHERALD_OK;
 }
 
-extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_Verify(
-    RootHeraldClient* client, const char* action, RootHeraldVerifyResult* out_result)
+extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollBegin(
+    RootHeraldClient* client, char** out_request_json)
 {
-    if (client == nullptr || out_result == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
-    std::memset(out_result, 0, sizeof(*out_result));
+    if (client == nullptr || out_request_json == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
+    *out_request_json = nullptr;
 
     auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
     std::lock_guard<std::mutex> g(impl->lock);
 
     if (impl->mockTpm)
     {
-        FillMockResult(out_result);
-        return ROOTHERALD_OK;
+        // Canned /devices/enroll body (base64 of placeholder bytes). CI only.
+        return EmitHeapJson(
+            "{\"ekPublicKey\":\"bW9jay1lay1wdWI=\","
+            "\"akPublicArea\":\"bW9jay1hay1wdWI=\","
+            "\"platform\":\"windows\"}",
+            out_request_json);
     }
 
-    // All enroll/activate/attest POSTs below carry the handle's publishable
-    // key as X-RootHerald-Site-Key for tenant attribution.
-    ScopedSiteKey siteKey(impl->apiKey);
-
-    // Step 1: ensure the device is enrolled. The legacy layer is idempotent —
-    // RH_PROTO_ERR_ALREADY_ENROLLED is the happy path on subsequent calls.
-    RootHeraldEnrollmentInfo enroll = {};
-    auto enrollResult = RootHeraldEnroll(impl->endpoint.c_str(), 0, &enroll);
-    if (enrollResult != ROOTHERALD_OK && enrollResult != RH_PROTO_ERR_ALREADY_ENROLLED)
-    {
-        out_result->verdict = ROOTHERALD_VERDICT_DENY;
-        CopyString(out_result->reason, sizeof(out_result->reason),
-                   "enrollment failed");
-        return MapRootHeraldStatus(enrollResult);
-    }
-    impl->deviceId = enroll.device_id;
-    RootHeraldSetDeviceId(impl->deviceId.c_str());
-
-    // Step 2: collect a fresh quote. The session id and nonce come from the
-    // server in the real flow; for the unsolicited "verify" entry point we
-    // bind a synthetic session id derived from action + monotonic counter.
-    RootHeraldAttestationInfo attest = {};
-    const char* useAction = (action && action[0] != '\0') ? action : "default";
-    std::string syntheticSessionId = std::string("rh-verify-") + useAction;
-    std::string syntheticNonce = "rh-verify-nonce";
-
-    auto attestResult = RootHeraldAttest(impl->endpoint.c_str(),
-                                          syntheticSessionId.c_str(),
-                                          syntheticNonce.c_str(),
-                                          syntheticNonce.size(),
-                                          &attest);
-
-    CopyString(out_result->device_id, sizeof(out_result->device_id), impl->deviceId);
-
-    if (attestResult == ROOTHERALD_OK)
-    {
-        out_result->verdict = ROOTHERALD_VERDICT_ALLOW;
-        CopyString(out_result->reason, sizeof(out_result->reason), "ok");
-    }
-    else
-    {
-        out_result->verdict = ROOTHERALD_VERDICT_DENY;
-        CopyString(out_result->reason, sizeof(out_result->reason),
-                   attest.failure_reason[0] ? attest.failure_reason : "attest failed");
-    }
-
-    // tpm_class and posture_json are server-derived; the v1 ABI ships them
-    // empty when we don't have a richer response shape. The server-side
-    // verifier already returns these inside the attestation JWT — Wave 3
-    // will parse them out and surface them here.
-    CopyString(out_result->tpm_class, sizeof(out_result->tpm_class), "");
-    CopyString(out_result->posture_json, sizeof(out_result->posture_json), "{}");
-
-    return MapRootHeraldStatus(attestResult);
+    // Keyless: gen AK + gather EK under one elevation, emit the /enroll body.
+    // The provider is held resident for the matching EnrollComplete in THIS
+    // process (single elevation spans begin -> complete; see rootherald_win.cpp).
+    return MapRootHeraldStatus(RootHeraldEnrollBegin(out_request_json));
 }
 
-extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_Enroll(
-    RootHeraldClient* client, int force_reenroll, RootHeraldEnrollResult* out_result)
+extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollComplete(
+    RootHeraldClient* client, const char* challenge_json, char** out_activation_json)
 {
-    if (client == nullptr || out_result == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
-    std::memset(out_result, 0, sizeof(*out_result));
+    if (client == nullptr || out_activation_json == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
+    *out_activation_json = nullptr;
+    if (challenge_json == nullptr || challenge_json[0] == '\0') return ROOTHERALD_ERR_INVALID_ARG;
 
     auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
     std::lock_guard<std::mutex> g(impl->lock);
 
     if (impl->mockTpm)
     {
-        FillMockEnrollResult(out_result);
-        impl->deviceId = out_result->device_id;
-        return ROOTHERALD_OK;
+        // Canned /devices/activate body. CI only.
+        return EmitHeapJson(
+            "{\"deviceId\":\"00000000-0000-4000-8000-000000000mock\","
+            "\"decryptedSecret\":\"bW9jay1zZWNyZXQ=\"}",
+            out_activation_json);
     }
 
-    ScopedSiteKey siteKey(impl->apiKey);
-
-    RootHeraldEnrollmentInfo enroll = {};
-    auto result = RootHeraldEnroll(impl->endpoint.c_str(), force_reenroll, &enroll);
-    if (result == RH_PROTO_OK)
-    {
-        impl->deviceId = enroll.device_id;
-    }
-    else if (result == RH_PROTO_ERR_ALREADY_ENROLLED)
-    {
-        // Benign: the legacy layer short-circuits before the server round-trip,
-        // so derive the deviceId locally (deterministic hash over the EK pub —
-        // the same id the server computes). Local-only, no network.
-        RootHeraldDeviceStatus status = {};
-        if (RootHeraldGetStatus(&status) == RH_PROTO_OK && status.device_id[0] != '\0')
-            impl->deviceId = status.device_id;
-    }
-    CopyString(out_result->device_id, sizeof(out_result->device_id), impl->deviceId);
-    return MapRootHeraldStatus(result);
-}
-
-extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_AttestSession(
-    RootHeraldClient* client, const char* session_id, const char* nonce_b64,
-    RootHeraldAttestResult* out_result)
-{
-    if (client == nullptr || out_result == nullptr ||
-        session_id == nullptr || session_id[0] == '\0' ||
-        nonce_b64 == nullptr || nonce_b64[0] == '\0')
-        return ROOTHERALD_ERR_INVALID_ARG;
-    std::memset(out_result, 0, sizeof(*out_result));
-
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-
-    if (impl->mockTpm)
-    {
-        FillMockAttestResult(session_id, out_result);
-        return ROOTHERALD_OK;
-    }
-
-    ScopedSiteKey siteKey(impl->apiKey);
-
-    // Bind the device known to this handle (set by a prior Enroll). When
-    // empty the legacy layer derives the deviceId from the EK so an unbound
-    // session still resolves to this device.
-    RootHeraldSetDeviceId(impl->deviceId.c_str());
-
-    RootHeraldAttestationInfo attest = {};
-    auto result = RootHeraldAttest(impl->endpoint.c_str(), session_id,
-                                   nonce_b64, std::strlen(nonce_b64), &attest);
-
-    // Self-heal the "locally enrolled, server doesn't know us" split-brain:
-    // the TPM holds a persistent AK (so Enroll short-circuits locally) but
-    // the server has no Device row (fresh database, pruned device, restored
-    // backup), so it rejects the session with `session_unbound`. A forced
-    // re-enrollment runs the full server ceremony and recreates the row —
-    // the deviceId is EK-derived, so the device keeps its identity. Retry
-    // exactly once; a second rejection is surfaced verbatim.
-    if (result == RH_PROTO_ERR_ATTESTATION_FAILED &&
-        std::strcmp(attest.failure_reason, "session_unbound") == 0)
-    {
-        RootHeraldEnrollmentInfo recover = {};
-        auto enrollResult = RootHeraldEnroll(impl->endpoint.c_str(),
-                                             /*force_reenroll=*/1, &recover);
-        if (enrollResult == RH_PROTO_OK)
-        {
-            impl->deviceId = recover.device_id;
-            RootHeraldSetDeviceId(impl->deviceId.c_str());
-            attest = {};
-            result = RootHeraldAttest(impl->endpoint.c_str(), session_id,
-                                      nonce_b64, std::strlen(nonce_b64), &attest);
-        }
-    }
-
-    CopyString(out_result->session_id, sizeof(out_result->session_id), attest.session_id);
-    CopyString(out_result->status, sizeof(out_result->status), attest.status);
-    CopyString(out_result->authorization_code, sizeof(out_result->authorization_code),
-               attest.authorization_code);
-    CopyString(out_result->redirect_uri, sizeof(out_result->redirect_uri), attest.redirect_uri);
-    CopyString(out_result->reason, sizeof(out_result->reason), attest.failure_reason);
-    return MapRootHeraldStatus(result);
-}
-
-extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetLinkToken(
-    RootHeraldClient* client, const char* link_token)
-{
-    if (client == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-    // One-shot semantics (consumed by the next attest) live in the legacy
-    // layer. NULL clears any pending token.
-    RootHeraldSetLinkToken(link_token);
-    return ROOTHERALD_OK;
+    // Keyless: TPM2_ActivateCredential over the relayed challenge, emit the
+    // /activate body.
+    return MapRootHeraldStatus(RootHeraldEnrollComplete(challenge_json, out_activation_json));
 }
 
 extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_GetDeviceInfo(
@@ -398,7 +212,7 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_GetDeviceInfo(
         return ROOTHERALD_OK;
     }
 
-    // Local-only: never touches the network, so no site key is installed.
+    // Local-only: never touches the network.
     RootHeraldDeviceStatus status = {};
     auto result = RootHeraldGetStatus(&status);
     out_result->is_enrolled = status.is_enrolled;
@@ -423,18 +237,28 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
         return ROOTHERALD_OK;
     }
 
-    // LOCAL-ONLY: never touches the network, so no site key is installed.
+    // LOCAL-ONLY: never touches the network.
     // Readiness signals, not a verdict — the verdict is always server-side.
     return MapRootHeraldStatus(RootHeraldCollectLocalPosture(out_result));
 }
 
-extern "C" ROOTHERALD_API int RootHerald_RunElevatedEstablishKey(
-    const char* server_url, const char* result_path)
+extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectEvidence(
+    const char* nonce_b64, char** out_evidence_json)
 {
-    // Public re-export of the legacy elevated-child entry point so hosts that
-    // consume only <rootherald.h> can route `--establish-key <url> <path>`
-    // argv here. See INTEGRATING.md ("Hosting requirement: --establish-key").
-    return RootHeraldRunElevatedEstablishKey(server_url, result_path);
+    // Per-attestation collect (keyless). HANDLE-LESS by design: no
+    // RootHeraldClient* is required because no key is consulted and no RootHerald
+    // network call is made. The embedder relays the returned blob to the
+    // CUSTOMER's server, which appraises it via POST /api/v1/attestations/verify.
+    if (out_evidence_json == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
+    *out_evidence_json = nullptr;
+    if (nonce_b64 == nullptr || nonce_b64[0] == '\0') return ROOTHERALD_ERR_INVALID_ARG;
+
+    return MapRootHeraldStatus(RootHeraldCollectEvidence(nonce_b64, out_evidence_json));
+}
+
+extern "C" ROOTHERALD_API void RootHeraldClient_FreeEvidence(char* evidence_json)
+{
+    RootHeraldFreeEvidence(evidence_json);
 }
 
 extern "C" ROOTHERALD_API const char* RootHerald_AbiVersionString(void)

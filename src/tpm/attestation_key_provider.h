@@ -1,23 +1,14 @@
 /**
- * IAttestationKeyProvider — a mode-agnostic strategy for the attestation
- * key (AK) lifecycle and credential activation.
+ * IAttestationKeyProvider — the attestation key (AK) lifecycle + credential
+ * activation contract.
  *
- * Windows has two viable backends for the same underlying service:
- *
- *   - PCP   (Microsoft Platform Crypto Provider, via NCrypt): runs entirely
- *           unprivileged. Credential activation goes through
- *           PCP_TPM12_IDACTIVATION. Works on firmwares where PCP cooperates.
- *
- *   - TBS   (raw TPM 2.0 command marshaling): credential activation uses
- *           TPM2_ActivateCredential directly, which Windows TBS only permits
- *           for an *elevated* caller. Works everywhere, but the activation
- *           step needs admin.
- *
- * Both backends provide the identical service contract below, so the
- * enrollment / attestation / rotation flows are written once against this
- * interface and the concrete backend is selected at run time (PCP-first,
- * elevated-TBS fallback). Callers must never branch on the concrete type —
- * only on the capability flags exposed here.
+ * The sole Windows backend is TbsKeyProvider (raw TPM 2.0 over TBS): the AK is
+ * created with an RSASSA-SHA256 template, TPM2_ActivateCredential binds it to
+ * the EK (which Windows TBS permits only for an *elevated* caller, so enrollment
+ * runs under one UAC), and the AK is evicted to a persistent handle so later
+ * TPM2_Quote runs unprivileged. The interface is retained as a thin seam for the
+ * per-platform backends (macOS Secure Enclave, etc.) that will implement the
+ * same contract; the enroll / attest flows are written once against it.
  */
 
 #ifndef ROOTHERALD_ATTESTATION_KEY_PROVIDER_H
@@ -32,13 +23,8 @@ class IAttestationKeyProvider {
 public:
     virtual ~IAttestationKeyProvider() = default;
 
-    /// Short identifier ("pcp" / "tbs"), used for logging and for caching the
-    /// winning method per machine. Stable — used as a persisted cache key.
+    /// Short identifier ("tbs"), used for logging.
     virtual const char* ModeName() const = 0;
-
-    /// True if ActivateCredential() requires the process to be elevated.
-    /// Drives the PCP-first / elevated-fallback orchestration.
-    virtual bool RequiresElevationForActivate() const = 0;
 
     /// Acquire backend resources (open the provider / TBS context). Returns
     /// false if the backend is unavailable.

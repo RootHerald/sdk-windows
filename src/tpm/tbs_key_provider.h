@@ -1,10 +1,10 @@
 /**
  * TbsKeyProvider — IAttestationKeyProvider backed by raw TPM 2.0 commands
- * over TBS. Credential activation uses TPM2_ActivateCredential directly,
- * which Windows TBS only permits for an elevated caller, so
- * RequiresElevationForActivate() is true. The AK is evicted to a persistent
- * handle so it survives reboots and is reachable from any TBS context (incl.
- * the unprivileged attestation process) for TPM2_Quote.
+ * over TBS. Credential activation uses TPM2_ActivateCredential directly, which
+ * Windows TBS only permits for an elevated caller, so enrollment runs under one
+ * UAC. The AK is evicted to a persistent handle so it survives reboots and is
+ * reachable from any TBS context (incl. the unprivileged attestation process)
+ * for TPM2_Quote.
  */
 
 #ifndef ROOTHERALD_TBS_KEY_PROVIDER_H
@@ -22,7 +22,6 @@ public:
     ~TbsKeyProvider() override;
 
     const char* ModeName() const override { return "tbs"; }
-    bool RequiresElevationForActivate() const override { return true; }
 
     bool Open() override;
     void Close() override;

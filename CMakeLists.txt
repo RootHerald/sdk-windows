@@ -66,6 +66,10 @@ add_executable(test_client tools/test_client.cpp)
 target_link_libraries(test_client PRIVATE RootHerald)
 target_include_directories(test_client PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 
+add_executable(gate_collect tools/gate_collect.cpp)
+target_link_libraries(gate_collect PRIVATE RootHerald)
+target_include_directories(gate_collect PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+
 add_executable(test_harness
     tools/test_harness.cpp
     tools/dbx_checker.cpp
