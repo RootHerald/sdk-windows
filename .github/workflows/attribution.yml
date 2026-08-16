@@ -1,0 +1,50 @@
+name: Attribution
+
+# Commits are authored by Root Herald. An agent is a tool used to produce them,
+# not a contributor to credit in the history. Policy lives in the platform
+# repo's CLAUDE.md; this gate enforces it rather than trusting it is read.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-agent-attribution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject agent attribution trailers
+        run: |
+          range="origin/${{ github.base_ref }}..HEAD"
+
+          # Patterns are deliberately loose. An earlier version anchored with ^
+          # and only listed a few tools, so a trailer indented by one space, or
+          # a plain "Generated with Claude Code" without the emoji, sailed
+          # straight through the gate it was supposed to trip.
+          #
+          #   [[:space:]]*  — leading whitespace does not bypass
+          #   co-authored-by:.*(agent list)  — anywhere on the line
+          #   generated with .*(agent list)  — with or without emoji/markdown
+          agents='claude|copilot|chatgpt|gpt-4|codex|cursor|devin|windsurf|aider|gemini|assistant|anthropic|openai'
+
+          if git log --format='%B' "$range" \
+             | grep -inE "^[[:space:]]*co-authored-by:.*($agents)|generated with.*($agents)|🤖"; then
+            echo "::error::Agent attribution found in a commit message — see CLAUDE.md."
+            echo "Rewrite the offending commits and force-push:"
+            echo "  git rebase -i origin/${{ github.base_ref }}   # reword, drop the trailer"
+            exit 1
+          fi
+
+          # Retired brand: CLAUDE.md treats this string as a hard failure
+          # anywhere in any repo, and it survived in commit messages across all
+          # nine repos until 2026-08-16 because nothing checked for it.
+          if git log --format='%B' "$range" | grep -inE 'platattest'; then
+            echo "::error::Retired 'Platattest' brand found in a commit message — see CLAUDE.md."
+            exit 1
+          fi
+
+          echo "No agent attribution or retired branding in $range"

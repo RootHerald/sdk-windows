@@ -49,7 +49,7 @@ set(RH_SYSTEM_LIBS ncrypt tbs winhttp bcrypt crypt32)
 
 add_library(RootHerald STATIC ${RH_LIB_SOURCES})
 target_include_directories(RootHerald
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/common
     PRIVATE ${RH_INCLUDE_DIRS}
 )
 target_link_libraries(RootHerald PUBLIC ${RH_SYSTEM_LIBS})
@@ -60,7 +60,7 @@ add_library(rootherald ALIAS RootHerald)
 # -----------------------------------------------------------------------------
 install(TARGETS RootHerald ARCHIVE DESTINATION lib)
 install(FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/rootherald.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/protocol.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/rootherald.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/protocol.h
     DESTINATION include
 )

@@ -1,0 +1,78 @@
+# ── Claude Code / agent state (NEVER commit) ──
+.claude/
+employees/.claude/
+
+# ── Secrets ──
+.env
+.env.local
+.env.production
+.env.development
+.env.keys
+*.pem
+*.key
+*.pfx
+*.crt
+dev-keys/
+secrets/
+
+# ── Build outputs ──
+bin/
+obj/
+build/
+dist/
+out/
+.next/
+.nuxt/
+target/
+.gradle/
+DerivedData/
+*.dll
+*.exe
+*.so
+*.dylib
+*.a
+*.lib
+*.framework
+
+# ── Dependencies ──
+node_modules/
+vendor/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# ── Test + tooling artifacts ──
+test-results/
+playwright-report/
+playwright/.cache/
+StrykerOutput/
+coverage/
+.coverage
+.nyc_output/
+htmlcov/
+
+# ── IDE ──
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.user
+*.suo
+.vs/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ──
+*.log
+logs/
+
+# ── Local config that shouldn't propagate ──
+*.local
+*.local.json
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Local smoke-build directory (not for commit)
+windows/build-verify/

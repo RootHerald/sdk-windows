@@ -1,0 +1,59 @@
+name: ABI drift
+
+# The three OS SDKs each vendor a copy of common/rootherald.h and
+# common/protocol.h. That duplication is deliberate — an auditor needs the ABI
+# contract in the same repo as the implementation it describes — but it can
+# drift, and a silent ABI divergence between platforms is the worst possible
+# failure for a product whose whole surface is one C ABI.
+#
+# No canonical private source is used on purpose: all three repos are public, so
+# each can read the others directly with no credential.
+on:
+  pull_request:
+    paths: ['common/**']
+  push:
+    branches: [main]
+    paths: ['common/**']
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare ABI headers against the sibling OS SDKs
+        run: |
+          set -uo pipefail
+          me="${GITHUB_REPOSITORY##*/}"
+          drift=0
+
+          for peer in sdk-windows sdk-linux sdk-macos; do
+            [ "$peer" = "$me" ] && continue
+            for h in rootherald.h protocol.h; do
+              url="https://raw.githubusercontent.com/RootHerald/$peer/main/common/$h"
+              if ! curl -sfL --max-time 25 "$url" -o "/tmp/$peer-$h"; then
+                echo "::warning::could not fetch $peer/common/$h (repo may not exist yet)"
+                continue
+              fi
+              if diff -u "common/$h" "/tmp/$peer-$h" > "/tmp/diff-$peer-$h"; then
+                echo "  match   $peer  $h"
+              else
+                echo "::error::ABI drift — common/$h differs from $peer"
+                head -40 "/tmp/diff-$peer-$h"
+                drift=1
+              fi
+            done
+          done
+
+          if [ "$drift" -ne 0 ]; then
+            echo "The C ABI must be identical across all three OS SDKs."
+            echo "Update every repo in the same change, or the platforms diverge silently."
+            exit 1
+          fi
+          echo "ABI headers identical across all published OS SDKs."

@@ -1,0 +1,39 @@
+name: Release
+
+# Builds the windows static archive and attaches it to a GitHub Release with
+# headers, checksums and Sigstore provenance.
+#
+# The archive carries lib/ AND include/ — a static library without its headers
+# cannot be compiled against, which is exactly what this pipeline shipped before
+# it staged through `cmake --install`.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: cmake -B build -S . -A x64
+      - run: cmake --build build --config Release
+      - run: cmake --install build --config Release --prefix stage/rootherald-windows-x64
+      - name: Checksums
+        shell: bash
+        run: cd stage/rootherald-windows-x64 && find . -type f -exec shasum -a 256 {} + > SHA256SUMS
+      - name: Archive
+        shell: bash
+        run: tar -czf rootherald-windows-x64.tar.gz -C stage/rootherald-windows-x64 .
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'rootherald-windows-x64.tar.gz'
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rootherald-windows-x64.tar.gz
+          generate_release_notes: true
