@@ -26,7 +26,9 @@ jobs:
       - run: cmake --install build --config Release --prefix stage/rootherald-windows-x64
       - name: Checksums
         shell: bash
-        run: cd stage/rootherald-windows-x64 && find . -type f -exec shasum -a 256 {} + > SHA256SUMS
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then H="sha256sum"; else H="shasum -a 256"; fi
+          cd stage/rootherald-windows-x64 && find . -type f -exec $H {} + > SHA256SUMS
       - name: Archive
         shell: bash
         run: tar -czf rootherald-windows-x64.tar.gz -C stage/rootherald-windows-x64 .
