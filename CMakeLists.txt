@@ -18,8 +18,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   src/certs/     — AIA cert chasing + Windows cert store
 #   src/transport/ — HTTPS via WinHTTP
 #   src/internal/  — Log shim + JSON helpers (not exported)
-#   tools/         — Dev diagnostics (test_client, test_harness, tpm_diag,
-#                    boot_verify, dbx_checker). NOT part of RootHerald.lib.
 # -----------------------------------------------------------------------------
 
 set(RH_LIB_SOURCES
@@ -56,37 +54,6 @@ target_include_directories(RootHerald
 )
 target_link_libraries(RootHerald PUBLIC ${RH_SYSTEM_LIBS})
 add_library(rootherald ALIAS RootHerald)
-
-# -----------------------------------------------------------------------------
-# Developer diagnostics — separate executables, not part of RootHerald.lib.
-# Each links the library plus any extra deps it needs.
-# -----------------------------------------------------------------------------
-
-add_executable(test_client tools/test_client.cpp)
-target_link_libraries(test_client PRIVATE RootHerald)
-target_include_directories(test_client PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
-
-add_executable(gate_collect tools/gate_collect.cpp)
-target_link_libraries(gate_collect PRIVATE RootHerald)
-target_include_directories(gate_collect PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
-
-add_executable(test_harness
-    tools/test_harness.cpp
-    tools/dbx_checker.cpp
-)
-target_link_libraries(test_harness PRIVATE RootHerald)
-target_include_directories(test_harness PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
-
-add_executable(tpm_diag tools/tpm_diag.cpp)
-target_link_libraries(tpm_diag PRIVATE RootHerald advapi32)
-target_include_directories(tpm_diag PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
-
-add_executable(boot_verify
-    tools/boot_verify.cpp
-    tools/dbx_checker.cpp
-)
-target_link_libraries(boot_verify PRIVATE RootHerald)
-target_include_directories(boot_verify PRIVATE ${RH_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 
 # -----------------------------------------------------------------------------
 # Install rules — for downstreams that use `cmake --install`.
