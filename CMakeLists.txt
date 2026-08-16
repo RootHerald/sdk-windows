@@ -5,6 +5,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # -----------------------------------------------------------------------------
+# C runtime: DYNAMIC (/MD, /MDd), stated rather than inherited.
+#
+# This matters more here than for a normal project. RootHerald.lib is a STATIC
+# archive that customers link into their own binary, so their CRT model has to
+# match ours — mismatch it and the link fails on CRT symbols (__imp_toupper and
+# friends) behind a wall of LNK4286 warnings that names nothing useful.
+#
+# /MD was already the effective setting, because it is CMake's default under
+# policy CMP0091. Pinning it changes no output; it stops the ABI of a shipped
+# release artifact from depending on which CMake defaults were in force on the
+# machine that built it. Consumers must compile with /MD (note that bare `cl`
+# with no runtime flag defaults to /MT and will NOT link).
+#
+# Documented for customers under "Linking" in README.md.
+# -----------------------------------------------------------------------------
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
+# -----------------------------------------------------------------------------
 # RootHerald.lib — embeddable STATIC native SDK (Windows).
 #
 # Customer integration is: link RootHerald.lib + include common/rootherald.h.
