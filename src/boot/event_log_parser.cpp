@@ -367,25 +367,18 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
 
 done:
     // Generate verdict
-    if (analysis.secureBootEnabled && analysis.revokedCount == 0) {
+    if (analysis.secureBootEnabled) {
         if (analysis.unknownCount == 0) {
             analysis.verdict = "PASS";
-            analysis.verdictReason = "Secure Boot enabled, all boot components verified, no revoked components";
+            analysis.verdictReason = "Secure Boot enabled, all boot components verified";
         } else {
             analysis.verdict = "WARNING";
             analysis.verdictReason = "Secure Boot enabled, but " + std::to_string(analysis.unknownCount) +
                                     " unknown measurement(s) detected";
         }
-    } else if (!analysis.secureBootEnabled) {
+    } else {
         analysis.verdict = "FAIL";
         analysis.verdictReason = "Secure Boot is DISABLED — boot chain integrity cannot be guaranteed";
-    } else if (analysis.revokedCount > 0) {
-        analysis.verdict = "FAIL";
-        analysis.verdictReason = std::to_string(analysis.revokedCount) +
-                                " revoked/known-bad component(s) detected in boot chain";
-    } else {
-        analysis.verdict = "WARNING";
-        analysis.verdictReason = "Could not determine Secure Boot status";
     }
 
     return analysis;

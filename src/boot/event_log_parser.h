@@ -65,7 +65,7 @@ struct EventLogEntry {
     std::map<uint16_t, std::vector<uint8_t>> digests; // algId -> digest
     std::vector<uint8_t> eventData;
     std::string description;  // Human-readable description
-    std::string classification; // "verified", "revoked", "unknown", "policy"
+    std::string classification; // "verified", "unknown", "policy"
 };
 
 struct EventLogAnalysis {
@@ -74,7 +74,6 @@ struct EventLogAnalysis {
     bool secureBootMicrosoftKeys = false;
     int verifiedCount = 0;
     int unknownCount = 0;
-    int revokedCount = 0;
     int policyCount = 0;
     std::string verdict; // "PASS", "FAIL", "WARNING"
     std::string verdictReason;

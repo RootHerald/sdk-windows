@@ -18,6 +18,7 @@
 
 #include "rootherald.h"
 #include "protocol.h"
+#include "client_internal.h"
 
 #include <cstring>
 #include <cstdio>
@@ -26,27 +27,15 @@
 #include <memory>
 #include <mutex>
 
-// Forward-declare the internal (keyless) entry points from rootherald_win.cpp.
-extern "C" RootHeraldResult RootHeraldEnrollBegin(char** out_enroll_json);
-extern "C" RootHeraldResult RootHeraldEnrollComplete(const char* challenge_json,
-                                                     char** out_activate_json);
-extern "C" RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status);
-extern "C" RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture);
-extern "C" RootHeraldResult RootHeraldCollectEvidence(const char* nonce_b64,
-                                                      char** out_evidence_json);
-extern "C" void RootHeraldFreeEvidence(char* evidence_json);
-
 namespace {
 
-constexpr const char* kAbiVersion = "3.0";
+/* Derived from the header so the reported version cannot drift from the one
+ * consumers compile against. */
+#define RH_STR2(x) #x
+#define RH_STR(x)  RH_STR2(x)
+constexpr const char* kAbiVersion =
+    RH_STR(ROOTHERALD_ABI_VERSION_MAJOR) "." RH_STR(ROOTHERALD_ABI_VERSION_MINOR);
 constexpr const char* kLibraryVersion = "0.2.0";  // bumped when public ABI stabilises
-
-struct RootHeraldClientImpl
-{
-    std::string applicationId;
-    bool mockTpm = false;
-    std::mutex lock;
-};
 
 // Helper: copy into a fixed-length null-terminated buffer.
 void CopyString(char* dst, size_t cap, const std::string& src)
@@ -74,43 +63,6 @@ RootHeraldStatus MapRootHeraldStatus(RootHeraldResult r)
     }
 }
 
-// Emit a heap-allocated copy of `json` (malloc'd so the caller frees it with
-// RootHeraldClient_FreeEvidence — which is free()). Used by the mock paths.
-RootHeraldStatus EmitHeapJson(const std::string& json, char** out)
-{
-    char* buf = (char*)malloc(json.size() + 1);
-    if (!buf) return ROOTHERALD_ERR_INTERNAL;
-    std::memcpy(buf, json.c_str(), json.size() + 1);
-    *out = buf;
-    return ROOTHERALD_OK;
-}
-
-void FillMockDeviceInfo(RootHeraldDeviceInfo* out)
-{
-    out->is_enrolled = 1;
-    out->has_tpm = 1;
-    CopyString(out->device_id, sizeof(out->device_id),
-               "00000000-0000-4000-8000-000000000mock");
-    CopyString(out->platform_name, sizeof(out->platform_name), "windows");
-}
-
-// Canned all-green posture for mock-TPM mode — same convention as the other
-// FillMock* helpers: never touch real hardware, never hit the network.
-void FillMockPosture(RootHeraldPosture* out)
-{
-    out->has_tpm = 1;
-    out->is_enrolled = 1;
-    out->ek_cert_present = 1;
-    out->secure_boot = 1;
-    out->oem_keyed = 1;
-    CopyString(out->oem_name, sizeof(out->oem_name), "MockOEM");
-    out->boot_log_measurements = 42;
-    out->boot_log_revoked = 0;
-    CopyString(out->device_id, sizeof(out->device_id),
-               "00000000-0000-4000-8000-000000000mock");
-    CopyString(out->detail_json, sizeof(out->detail_json), "{\"mock\":true}");
-}
-
 } // namespace
 
 // ------------------------------------------------------------------
@@ -119,32 +71,21 @@ void FillMockPosture(RootHeraldPosture* out)
 
 extern "C" ROOTHERALD_API RootHeraldClient* RootHeraldClient_Create(void)
 {
-    auto impl = std::make_unique<RootHeraldClientImpl>();
-    return reinterpret_cast<RootHeraldClient*>(impl.release());
+    auto impl = std::make_unique<RootHeraldClient>();
+    return impl.release();
 }
 
 extern "C" ROOTHERALD_API void RootHeraldClient_Destroy(RootHeraldClient* client)
 {
-    delete reinterpret_cast<RootHeraldClientImpl*>(client);
+    delete client;
 }
 
 extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetApplicationId(
     RootHeraldClient* client, const char* app_id)
 {
     if (client == nullptr || app_id == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-    impl->applicationId = app_id;
-    return ROOTHERALD_OK;
-}
-
-extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetMockTpm(
-    RootHeraldClient* client, int mock_enabled)
-{
-    if (client == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-    impl->mockTpm = (mock_enabled != 0);
+    std::lock_guard<std::mutex> g(client->lock);
+    client->applicationId = app_id;
     return ROOTHERALD_OK;
 }
 
@@ -154,18 +95,7 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollBegin(
     if (client == nullptr || out_request_json == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
     *out_request_json = nullptr;
 
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-
-    if (impl->mockTpm)
-    {
-        // Canned /devices/enroll body (base64 of placeholder bytes). CI only.
-        return EmitHeapJson(
-            "{\"ekPublicKey\":\"bW9jay1lay1wdWI=\","
-            "\"akPublicArea\":\"bW9jay1hay1wdWI=\","
-            "\"platform\":\"windows\"}",
-            out_request_json);
-    }
+    std::lock_guard<std::mutex> g(client->lock);
 
     // Keyless: gen AK + gather EK under one elevation, emit the /enroll body.
     // The provider is held resident for the matching EnrollComplete in THIS
@@ -180,17 +110,7 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollComplete(
     *out_activation_json = nullptr;
     if (challenge_json == nullptr || challenge_json[0] == '\0') return ROOTHERALD_ERR_INVALID_ARG;
 
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-
-    if (impl->mockTpm)
-    {
-        // Canned /devices/activate body. CI only.
-        return EmitHeapJson(
-            "{\"deviceId\":\"00000000-0000-4000-8000-000000000mock\","
-            "\"decryptedSecret\":\"bW9jay1zZWNyZXQ=\"}",
-            out_activation_json);
-    }
+    std::lock_guard<std::mutex> g(client->lock);
 
     // Keyless: TPM2_ActivateCredential over the relayed challenge, emit the
     // /activate body.
@@ -203,14 +123,7 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_GetDeviceInfo(
     if (client == nullptr || out_result == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
     std::memset(out_result, 0, sizeof(*out_result));
 
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-
-    if (impl->mockTpm)
-    {
-        FillMockDeviceInfo(out_result);
-        return ROOTHERALD_OK;
-    }
+    std::lock_guard<std::mutex> g(client->lock);
 
     // Local-only: never touches the network.
     RootHeraldDeviceStatus status = {};
@@ -228,14 +141,7 @@ extern "C" ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
     if (client == nullptr || out_result == nullptr) return ROOTHERALD_ERR_INVALID_ARG;
     std::memset(out_result, 0, sizeof(*out_result));
 
-    auto* impl = reinterpret_cast<RootHeraldClientImpl*>(client);
-    std::lock_guard<std::mutex> g(impl->lock);
-
-    if (impl->mockTpm)
-    {
-        FillMockPosture(out_result);
-        return ROOTHERALD_OK;
-    }
+    std::lock_guard<std::mutex> g(client->lock);
 
     // LOCAL-ONLY: never touches the network.
     // Readiness signals, not a verdict — the verdict is always server-side.

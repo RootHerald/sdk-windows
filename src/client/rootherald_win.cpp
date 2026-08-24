@@ -15,20 +15,20 @@
  * PCP's TBS context. TpmPcp is retained solely for the unprivileged EK
  * public-key / cert read. EK gathering and TPM2_Quote are mode-agnostic.
  *
- * Uses WinHTTP for server communication.
+ * The SDK opens no socket to Root Herald. The one outbound request it can make
+ * is the best-effort AMD AIA EK-certificate fetch during enrollment, which lives
+ * behind amd_aia_fetch.
  */
 
-#include "rootherald_win.h"
+#include "client_internal.h"
 #include "rootherald.h"
 #include "tpm_pcp.h"
 #include "tpm_commands.h"
-#include "attestation_key_provider.h"
 #include "tbs_key_provider.h"
 #include "amd_aia_fetch.h"
 #include "event_log.h"
 #include "event_log_parser.h"
 #include "secureboot_validator.h"
-#include "http_winhttp.h"
 #include "json_helpers.h"
 #include "win_cert_store_intermediates.h"
 #include "log.h"
@@ -546,7 +546,7 @@ extern "C" ROOTHERALD_API RootHeraldResult RootHeraldEnrollComplete(
 // Return an opened provider whose AK is loaded, or null if not enrolled. The AK
 // lives at a persistent handle (valid across TBS contexts and in an unprivileged
 // process), so a single load suffices — no backend probing, no cache.
-static std::unique_ptr<RootHerald::IAttestationKeyProvider> SelectEnrolledProvider()
+static std::unique_ptr<RootHerald::TbsKeyProvider> SelectEnrolledProvider()
 {
     auto p = std::make_unique<RootHerald::TbsKeyProvider>(kTbsAkPersistentHandle);
     if (p->Open() && p->LoadAk()) return p;
@@ -668,7 +668,6 @@ static RootHeraldResult CollectEvidenceFields(
             {"totalMeasurements",       std::to_string(eventAnalysis.entries.size())},
             {"verifiedCount",           std::to_string(eventAnalysis.verifiedCount)},
             {"unknownCount",            std::to_string(eventAnalysis.unknownCount)},
-            {"revokedCount",            std::to_string(eventAnalysis.revokedCount)},
             {"verdict",                 chainReport.verdict}
         });
     }
@@ -862,7 +861,6 @@ extern "C" RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out
         out_posture->oem_keyed = chainReport.pkIsKnownOem ? 1 : 0;
         strncpy_s(out_posture->oem_name, chainReport.pkOemName.c_str(), _TRUNCATE);
         out_posture->boot_log_measurements = (int)eventAnalysis.entries.size();
-        out_posture->boot_log_revoked = eventAnalysis.revokedCount;
 
         detail["secureBootEnabled"] = chainReport.secureBootEnabled ? "true" : "false";
         detail["pkIsKnownOem"]      = chainReport.pkIsKnownOem ? "true" : "false";
@@ -872,7 +870,6 @@ extern "C" RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out
         detail["totalMeasurements"] = std::to_string(eventAnalysis.entries.size());
         detail["verifiedCount"]     = std::to_string(eventAnalysis.verifiedCount);
         detail["unknownCount"]      = std::to_string(eventAnalysis.unknownCount);
-        detail["revokedCount"]      = std::to_string(eventAnalysis.revokedCount);
         detail["verdict"]           = chainReport.verdict;
     } else {
         detail["eventLog"] = "unavailable";
