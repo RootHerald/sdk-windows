@@ -6,8 +6,19 @@ name: ABI drift
 # drift, and a silent ABI divergence between platforms is the worst possible
 # failure for a product whose whole surface is one C ABI.
 #
-# No canonical private source is used on purpose: all three repos are public, so
-# each can read the others directly with no credential.
+# Two things make a naive comparison unreliable, and both produced false
+# failures before this was written:
+#
+#   * A coordinated ABI change cannot land green. Each repo compares itself
+#     against the others' main, so while a three-repo change is in flight every
+#     PR sees two stale siblings. Enforcing that on a PR blocks the very change
+#     it is meant to protect, so on pull_request this reports without failing.
+#     main is where identity is actually required, and there it is enforced.
+#
+#   * raw.githubusercontent.com is CDN-cached and lags a merge by minutes, so a
+#     run immediately after a merge can read a sibling's pre-merge header. The
+#     comparison uses the git ref API instead, which is not cached that way, and
+#     retries before believing a difference.
 on:
   pull_request:
     paths: ['common/**']
@@ -28,32 +39,72 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Compare ABI headers against the sibling OS SDKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Enforce on main and on the nightly sweep; report-only on a PR, where
+          # an in-flight coordinated change legitimately looks divergent.
+          ENFORCE: ${{ github.event_name != 'pull_request' }}
         run: |
           set -uo pipefail
           me="${GITHUB_REPOSITORY##*/}"
           drift=0
+          unreachable=0
+
+          # Blob SHA of a path on a peer's main, via the API rather than the raw
+          # CDN. Retries: a merge and this run can race, and a stale read must not
+          # be reported as drift.
+          peer_blob_sha() {
+            local peer="$1" path="$2" sha=""
+            for attempt in 1 2 3; do
+              sha="$(gh api "repos/RootHerald/$peer/contents/$path?ref=main" \
+                       --jq .sha 2>/dev/null || true)"
+              [ -n "$sha" ] && { echo "$sha"; return 0; }
+              sleep $(( attempt * 5 ))
+            done
+            return 1
+          }
 
           for peer in sdk-windows sdk-linux sdk-macos; do
             [ "$peer" = "$me" ] && continue
             for h in rootherald.h protocol.h; do
-              url="https://raw.githubusercontent.com/RootHerald/$peer/main/common/$h"
-              if ! curl -sfL --max-time 25 "$url" -o "/tmp/$peer-$h"; then
-                echo "::warning::could not fetch $peer/common/$h (repo may not exist yet)"
+              mine="$(git hash-object "common/$h")"
+
+              if ! theirs="$(peer_blob_sha "$peer" "common/$h")"; then
+                echo "::warning::could not read $peer/common/$h after 3 attempts"
+                unreachable=1
                 continue
               fi
-              if diff -u "common/$h" "/tmp/$peer-$h" > "/tmp/diff-$peer-$h"; then
+
+              if [ "$mine" = "$theirs" ]; then
                 echo "  match   $peer  $h"
-              else
-                echo "::error::ABI drift — common/$h differs from $peer"
-                head -40 "/tmp/diff-$peer-$h"
-                drift=1
+                continue
               fi
+
+              # Blob SHAs are over identical bytes, so a mismatch is real — but
+              # print the diff, because "they differ" is not actionable on its own.
+              echo "::error::ABI drift — common/$h differs from $peer"
+              gh api "repos/RootHerald/$peer/contents/common/$h?ref=main" \
+                --jq .content 2>/dev/null | base64 -d > "/tmp/$peer-$h" || true
+              diff -u "common/$h" "/tmp/$peer-$h" | head -40 || true
+              drift=1
             done
           done
+
+          if [ "$drift" -eq 0 ] && [ "$unreachable" -eq 0 ]; then
+            echo "ABI headers identical across all published OS SDKs."
+            exit 0
+          fi
 
           if [ "$drift" -ne 0 ]; then
             echo "The C ABI must be identical across all three OS SDKs."
             echo "Update every repo in the same change, or the platforms diverge silently."
-            exit 1
           fi
-          echo "ABI headers identical across all published OS SDKs."
+
+          if [ "$ENFORCE" != "true" ]; then
+            echo "::notice::Reporting only — this is a pull request. A coordinated"
+            echo "::notice::three-repo ABI change looks divergent until the last one merges."
+            echo "::notice::main enforces this; land all three together."
+            exit 0
+          fi
+
+          exit 1
