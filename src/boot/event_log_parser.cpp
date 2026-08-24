@@ -1,18 +1,20 @@
-/**
- * TCG Event Log Parser — Full implementation.
+/*
+ * Parses the TCG event log: the legacy TCG_PCR_EVENT Spec ID header followed
+ * by TCG_PCR_EVENT2 entries.
  *
- * Parses both legacy TCG_PCR_EVENT (Spec ID header) and TCG_PCR_EVENT2
- * entries. Extracts EFI variable names, boot application paths,
- * firmware blob descriptions, and Secure Boot policy from the event data.
+ * The log is untrusted binary input, so each step bounds-checks against the
+ * remaining length before advancing the cursor. Nothing produced here is a
+ * security verdict — the server re-derives boot posture from the quote-bound
+ * log and never gates on this.
  */
 
 #include "event_log_parser.h"
+
+#include <sal.h>
 #include <cstring>
-#include <algorithm>
 
 namespace RootHerald {
 
-// EFI GUID for Secure Boot variables
 static const uint8_t EFI_GLOBAL_VARIABLE_GUID[] = {
     0x61, 0xDF, 0xE4, 0x8B, 0xCA, 0x93, 0xD2, 0x11,
     0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C
@@ -23,8 +25,8 @@ static const uint8_t EFI_IMAGE_SECURITY_DATABASE_GUID[] = {
     0xA3, 0xBC, 0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F
 };
 
-static uint16_t ReadU16LE(const uint8_t* p) { return p[0] | (p[1] << 8); }
-static uint32_t ReadU32LE(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
+static uint16_t ReadU16LE(_In_reads_bytes_(2) const uint8_t* p) { return p[0] | (p[1] << 8); }
+static uint32_t ReadU32LE(_In_reads_bytes_(4) const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
 
 const char* EventTypeName(uint32_t eventType) {
     switch (eventType) {
@@ -58,18 +60,17 @@ const char* EventTypeName(uint32_t eventType) {
     }
 }
 
-/// Extract a UCS-2 (UTF-16LE) string from EFI variable event data.
-/// EFI variable events: GUID (16) + UnicodeNameLength (8) + VariableDataLength (8) + UnicodeName + VariableData
+/* Event data layout: GUID(16) UnicodeNameLength(8) VariableDataLength(8)
+ * UnicodeName VariableData. The name is UCS-2LE; anything non-ASCII becomes
+ * a question mark, and the walk stops at 256 characters. */
 static std::string ExtractEfiVariableName(const std::vector<uint8_t>& data) {
     if (data.size() < 32) return "";
 
-    // Skip GUID (16 bytes)
     uint64_t nameLen = 0;
-    memcpy(&nameLen, data.data() + 16, 8); // UnicodeNameLength (chars, not bytes)
+    memcpy(&nameLen, data.data() + 16, 8); // UnicodeNameLength is in chars
 
     if (32 + nameLen * 2 > data.size()) return "";
 
-    // Convert UCS-2LE to ASCII
     std::string name;
     for (uint64_t i = 0; i < nameLen && i < 256; i++) {
         uint16_t ch = ReadU16LE(data.data() + 32 + i * 2);
@@ -80,21 +81,19 @@ static std::string ExtractEfiVariableName(const std::vector<uint8_t>& data) {
     return name;
 }
 
-/// Extract device path from EFI boot application events.
-/// These contain UEFI_IMAGE_LOAD_EVENT: ImageLocationInMemory (8) + ImageLengthInMemory (8) +
-/// ImageLinkTimeAddress (8) + LengthOfDevicePath (8) + DevicePath
+/* UEFI_IMAGE_LOAD_EVENT: ImageLocationInMemory(8) ImageLengthInMemory(8)
+ * ImageLinkTimeAddress(8) LengthOfDevicePath(8) DevicePath. The device path is
+ * a binary node structure, so this recovers the readable UCS-2LE run inside it
+ * rather than decoding every node type. */
 static std::string ExtractBootAppPath(const std::vector<uint8_t>& data) {
     if (data.size() < 32) return "(unknown path)";
 
-    // The device path is a complex binary structure. Look for readable strings in it.
     std::string result;
-    // Scan for UCS-2LE file path strings (look for backslash patterns)
     for (size_t i = 32; i + 1 < data.size(); i += 2) {
         uint16_t ch = ReadU16LE(data.data() + i);
         if (ch == '\\' || ch == '/' || (ch >= 'A' && ch <= 'z') || ch == '.' || ch == '-' || ch == '_') {
             if (ch < 128) result += (char)ch;
         } else if (ch == 0 && !result.empty()) {
-            // End of string
             if (result.length() > 4 && (result.find(".efi") != std::string::npos ||
                                           result.find(".EFI") != std::string::npos ||
                                           result.find("\\") != std::string::npos)) {
@@ -108,22 +107,20 @@ static std::string ExtractBootAppPath(const std::vector<uint8_t>& data) {
     return result.empty() ? "(binary device path)" : result;
 }
 
-static std::string BytesToHex(const uint8_t* data, size_t len) {
-    static const char hex[] = "0123456789abcdef";
+static std::string BytesToHex(_In_reads_bytes_(len) const uint8_t* data, size_t len) {
+    static const char HEX[] = "0123456789abcdef";
     std::string result;
     result.reserve(len * 2);
     for (size_t i = 0; i < len; i++) {
-        result += hex[data[i] >> 4];
-        result += hex[data[i] & 0x0F];
+        result += HEX[data[i] >> 4];
+        result += HEX[data[i] & 0x0F];
     }
     return result;
 }
 
-/// Determine if a PCR[7] variable event indicates Secure Boot is enabled.
+/* The SecureBoot variable's data is a single byte, 1 = enabled. */
 static bool IsSecureBootEnabled(const std::string& varName, const std::vector<uint8_t>& data) {
     if (varName != "SecureBoot") return false;
-    // The variable data follows the header (GUID + nameLen + dataLen + name)
-    // For SecureBoot, the value is a single byte: 1 = enabled, 0 = disabled
     if (data.size() < 33) return false;
 
     uint64_t nameLen = 0, dataLen = 0;
@@ -142,16 +139,13 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
     const uint8_t* p = rawLog.data();
     size_t remaining = rawLog.size();
 
-    // --- Parse legacy Spec ID Event (first entry) ---
+    // Legacy TCG_PCR_EVENT Spec ID header, if present:
+    // pcrIndex(4) eventType(4) SHA1digest(20) eventDataSize(4) eventData
     if (remaining >= 32) {
-        uint32_t pcrIndex = ReadU32LE(p);
         uint32_t eventType = ReadU32LE(p + 4);
-
         if (eventType == EV_NO_ACTION) {
-            // Legacy TCG_PCR_EVENT header
-            // Skip: pcrIndex(4) + eventType(4) + SHA1digest(20) + eventDataSize(4) + eventData
             uint32_t eventDataSize = ReadU32LE(p + 28);
-            size_t skip = 32 + eventDataSize;
+            size_t skip = 32 + (size_t)eventDataSize;
             if (skip <= remaining) {
                 p += skip;
                 remaining -= skip;
@@ -159,8 +153,9 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
         }
     }
 
-    // --- Parse TCG_PCR_EVENT2 entries ---
-    while (remaining >= 12) {
+    // A truncated entry ends the walk and is discarded rather than emitted.
+    bool truncated = false;
+    while (remaining >= 12 && !truncated) {
         EventLogEntry entry;
         entry.pcrIndex = ReadU32LE(p);
         p += 4; remaining -= 4;
@@ -170,15 +165,15 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
 
         entry.eventTypeName = EventTypeName(entry.eventType);
 
-        // Digests (TPML_DIGEST_VALUES)
+        // TPML_DIGEST_VALUES
         if (remaining < 4) break;
         uint32_t digestCount = ReadU32LE(p);
         p += 4; remaining -= 4;
 
-        if (digestCount > 8) break; // Sanity check
+        if (digestCount > 8) break;
 
         for (uint32_t i = 0; i < digestCount; i++) {
-            if (remaining < 2) goto done;
+            if (remaining < 2) { truncated = true; break; }
             uint16_t algId = ReadU16LE(p);
             p += 2; remaining -= 2;
 
@@ -189,15 +184,16 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
                 case 0x000C: digestSize = 48; break;  // SHA-384
                 case 0x000D: digestSize = 64; break;  // SHA-512
                 case 0x0012: digestSize = 32; break;  // SM3
-                default: goto done; // Unknown algorithm
+                default: break;                       // size unknown: stop here
             }
+            if (digestSize == 0) { truncated = true; break; }
 
-            if (remaining < digestSize) goto done;
+            if (remaining < digestSize) { truncated = true; break; }
             entry.digests[algId] = std::vector<uint8_t>(p, p + digestSize);
             p += digestSize; remaining -= digestSize;
         }
+        if (truncated) break;
 
-        // Event data
         if (remaining < 4) break;
         uint32_t eventDataSize = ReadU32LE(p);
         p += 4; remaining -= 4;
@@ -206,7 +202,6 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
         entry.eventData.assign(p, p + eventDataSize);
         p += eventDataSize; remaining -= eventDataSize;
 
-        // --- Classify the entry ---
         switch (entry.eventType) {
             case EV_EFI_VARIABLE_DRIVER_CONFIG:
             case EV_EFI_VARIABLE_BOOT:
@@ -216,7 +211,6 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
                 entry.classification = "policy";
                 analysis.policyCount++;
 
-                // Check Secure Boot status
                 if (varName == "SecureBoot") {
                     analysis.secureBootEnabled = IsSecureBootEnabled(varName, entry.eventData);
                     entry.description += analysis.secureBootEnabled ? " (ENABLED)" : " (DISABLED)";
@@ -224,7 +218,9 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
                 if (varName == "PK" || varName == "KEK" || varName == "db" || varName == "dbx") {
                     entry.description += " (Secure Boot key database)";
                     if (varName == "db" || varName == "KEK") {
-                        analysis.secureBootMicrosoftKeys = true; // Simplified: assume MS keys if db/KEK present
+                        // Presence of db/KEK is taken as Microsoft keying. It is
+                        // descriptive only; the verdict is server-side.
+                        analysis.secureBootMicrosoftKeys = true;
                     }
                 }
                 break;
@@ -233,7 +229,6 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
             case EV_EFI_BOOT_SERVICES_APPLICATION: {
                 std::string path = ExtractBootAppPath(entry.eventData);
                 entry.description = "Boot Application: " + path;
-                // Boot applications loaded with Secure Boot ON are Microsoft-signed
                 entry.classification = "verified";
                 analysis.verifiedCount++;
                 break;
@@ -250,13 +245,12 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
             case EV_EFI_PLATFORM_FIRMWARE_BLOB:
             case EV_EFI_PLATFORM_FIRMWARE_BLOB2: {
                 entry.description = "Platform Firmware Blob";
-                entry.classification = "verified"; // Firmware is measured before execution
+                entry.classification = "verified";
                 analysis.verifiedCount++;
                 break;
             }
 
             case EV_S_CRTM_VERSION: {
-                // CRTM version string (usually the BIOS version)
                 std::string version;
                 for (size_t i = 0; i + 1 < entry.eventData.size(); i += 2) {
                     uint16_t ch = ReadU16LE(entry.eventData.data() + i);
@@ -345,8 +339,8 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
             }
 
             default: {
-                // PCR[11-14] are Windows OS measurements (BitLocker, Secure Launch, etc.)
-                // These are expected on Windows and not boot-level threats
+                // PCR[11-14] carry Windows OS measurements (BitLocker, Secure
+                // Launch); expected here, so not counted as unknown.
                 if (entry.pcrIndex >= 11 && entry.pcrIndex <= 14) {
                     entry.description = "Windows OS measurement (PCR[" +
                         std::to_string(entry.pcrIndex) + "])";
@@ -365,8 +359,6 @@ EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
         analysis.entries.push_back(std::move(entry));
     }
 
-done:
-    // Generate verdict
     if (analysis.secureBootEnabled) {
         if (analysis.unknownCount == 0) {
             analysis.verdict = "PASS";

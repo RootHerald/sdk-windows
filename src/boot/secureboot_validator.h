@@ -1,19 +1,13 @@
-/**
- * Secure Boot Chain Validator
+/*
+ * Extracts the Secure Boot certificate chain (PK / KEK / db / dbx) from the
+ * PCR[7] EFI variable events and checks it against known Microsoft and OEM
+ * certificates.
  *
- * Parses EFI Secure Boot variable data from PCR[7] event log entries
- * to extract and validate the complete Secure Boot certificate chain:
- * - PK (Platform Key): OEM identity
- * - KEK (Key Exchange Key): Microsoft + OEM control
- * - db (Allowed Signatures): Microsoft UEFI CA
- * - dbx (Forbidden Signatures): Revocation list
- *
- * Validates that the chain is legitimate by checking certificate
- * thumbprints against known Microsoft and OEM certificates.
+ * Advisory only. The server re-derives boot posture from the quote-bound event
+ * log and never gates on the report produced here.
  */
 
-#ifndef ROOTHERALD_SECUREBOOT_VALIDATOR_H
-#define ROOTHERALD_SECUREBOOT_VALIDATOR_H
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -24,52 +18,42 @@ namespace RootHerald {
 struct CertInfo {
     std::string subject;
     std::string issuer;
-    std::string thumbprintSha256; // Hex uppercase
+    std::string thumbprintSha256;   // SHA-256 of the DER, hex uppercase
     std::string notBefore;
     std::string notAfter;
     bool isMicrosoftCert = false;
     bool isKnownOem = false;
-    std::string oemName; // If identified
+    std::string oemName;            // empty unless isKnownOem
 };
 
 struct SecureBootChainReport {
     bool secureBootEnabled = false;
 
-    // PK (Platform Key) — should be OEM
-    std::vector<CertInfo> pkCerts;
+    std::vector<CertInfo> pkCerts;      // Platform Key — the OEM's identity
     bool pkIsKnownOem = false;
     std::string pkOemName;
 
-    // KEK (Key Exchange Key) — should include Microsoft
-    std::vector<CertInfo> kekCerts;
+    std::vector<CertInfo> kekCerts;     // Key Exchange Key — expect Microsoft
     bool kekHasMicrosoft = false;
 
-    // db (Allowed Signatures Database) — must include Microsoft UEFI CA
-    std::vector<CertInfo> dbCerts;
+    std::vector<CertInfo> dbCerts;      // allowed signatures
     bool dbHasMicrosoftUefiCa2011 = false;
     bool dbHasMicrosoftUefiCa2023 = false;
     bool dbHasWindowsPca2011 = false;
 
-    // dbx (Forbidden Signatures) — revocation list
-    int dbxHashCount = 0;
+    int dbxHashCount = 0;               // forbidden signatures
 
-    // Overall
     bool chainValid = false;
     std::string verdict;
     std::vector<std::string> warnings;
     std::vector<std::string> errors;
 };
 
-/// Parse EFI variable event data and extract certificate information.
-/// The eventData is from a PCR[7] EV_EFI_VARIABLE_DRIVER_CONFIG event.
-/// Format: EFI_GUID(16) + UnicodeNameLength(8) + VariableDataLength(8) +
-///         UnicodeName(UnicodeNameLength*2) + VariableData
+/* variableData is the raw event data of a PCR[7] EV_EFI_VARIABLE_DRIVER_CONFIG
+ * entry: EFI_GUID(16) UnicodeNameLength(8) VariableDataLength(8) UnicodeName
+ * VariableData. Non-X.509 signature lists yield no certificates. */
 std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData);
 
-/// Validate the complete Secure Boot chain from event log entries.
-SecureBootChainReport ValidateSecureBootChain(
-    const std::vector<uint8_t>& rawEventLog);
+SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEventLog);
 
 } // namespace RootHerald
-
-#endif /* ROOTHERALD_SECUREBOOT_VALIDATOR_H */

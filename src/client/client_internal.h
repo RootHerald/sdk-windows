@@ -1,17 +1,16 @@
-/**
- * Private RootHeraldClient state and the Windows-internal entry points, shared
- * between the ABI facade (rootherald_client.cpp) and the keyless driver
- * (rootherald_win.cpp). Not installed; never part of the public surface.
+/*
+ * Private RootHeraldClient state and the Windows-internal C entry points
+ * shared between the ABI facade (rootherald_client.cpp) and the driver
+ * (rootherald_win.cpp). Not installed and not part of the public surface.
  *
- * RootHeraldDeviceStatus / RootHeraldGetStatus / RootHeraldSetDeviceId were
- * demoted here from protocol.h in ABI 4.0: the native messaging host still
- * calls them across the C boundary, but they are not something a customer
- * integrates against.
+ * The native messaging host calls these across the C boundary, but they are
+ * not something a customer integrates against.
  */
 
 #ifndef ROOTHERALD_CLIENT_INTERNAL_H
 #define ROOTHERALD_CLIENT_INTERNAL_H
 
+#include <sal.h>
 #include <mutex>
 #include <string>
 
@@ -20,8 +19,8 @@
 
 extern "C" {
 
-/* Internal result codes. The public surface is RootHeraldStatus in rootherald.h;
- * these are the platform implementations' own vocabulary, mapped at the boundary. */
+/* The platform implementations' own vocabulary. rootherald_client.cpp maps it
+ * onto the public RootHeraldStatus exactly once. */
 typedef enum {
     RH_PROTO_OK = 0,
     RH_PROTO_ERR_NO_TPM = 1,
@@ -33,13 +32,10 @@ typedef enum {
     RH_PROTO_ERR_INVALID_PARAM = 7,
     RH_PROTO_ERR_ALREADY_ENROLLED = 8,
     /* Cold enrollment needs an elevated process for raw-TBS AK creation and
-     * TPM2_ActivateCredential. The SDK does not elevate; run the keyless
-     * EnrollBegin/EnrollComplete pair in an elevated resident worker. */
+     * TPM2_ActivateCredential. The SDK never elevates on the caller's behalf. */
     RH_PROTO_ERR_ELEVATION_REQUIRED = 9
 } RootHeraldResult;
 
-
-/* Device status, as reported by RootHeraldGetStatus. */
 typedef struct {
     int is_enrolled;
     char device_id[64];
@@ -47,25 +43,28 @@ typedef struct {
     int has_tpm;
 } RootHeraldDeviceStatus;
 
-/* Local enrollment / TPM status. No network. */
-ROOTHERALD_API RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status);
+ROOTHERALD_API RootHeraldResult RootHeraldGetStatus(_Out_ RootHeraldDeviceStatus* out_status);
 
-/*
- * Bind a caller-supplied device ID into collected evidence. When left unset
- * (or cleared with NULL) CollectEvidence derives the deviceId from the EK.
- * Host hook; no network.
- */
-ROOTHERALD_API void RootHeraldSetDeviceId(const char* device_id);
+/* Binds a caller-supplied device id into collected evidence. NULL clears it,
+ * and CollectEvidence then derives the id from the EK. */
+ROOTHERALD_API void RootHeraldSetDeviceId(_In_opt_z_ const char* device_id);
 
-/* Keyless enrollment, evidence collection and posture — implemented in
- * rootherald_win.cpp, mapped onto the public ABI by rootherald_client.cpp. */
-ROOTHERALD_API RootHeraldResult RootHeraldEnrollBegin(char** out_enroll_json);
-ROOTHERALD_API RootHeraldResult RootHeraldEnrollComplete(const char* challenge_json,
-                                                         char** out_activate_json);
-ROOTHERALD_API RootHeraldResult RootHeraldCollectEvidence(const char* nonce_b64,
-                                                          char** out_evidence_json);
-ROOTHERALD_API RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture);
-ROOTHERALD_API void RootHeraldFreeEvidence(char* evidence_json);
+/* out_*_json buffers are caller-owned: free with RootHeraldFreeEvidence. Each is
+ * set on success and left null otherwise, which is what lets the public wrappers
+ * carry the stronger _Outptr_result_z_ contract. */
+_Success_(return == RH_PROTO_OK)
+ROOTHERALD_API RootHeraldResult RootHeraldEnrollBegin(
+    _Outptr_result_z_ char** out_enroll_json);
+_Success_(return == RH_PROTO_OK)
+ROOTHERALD_API RootHeraldResult RootHeraldEnrollComplete(
+    _In_z_ const char* challenge_json,
+    _Outptr_result_z_ char** out_activate_json);
+_Success_(return == RH_PROTO_OK)
+ROOTHERALD_API RootHeraldResult RootHeraldCollectEvidence(
+    _In_z_ const char* nonce_b64,
+    _Outptr_result_z_ char** out_evidence_json);
+ROOTHERALD_API RootHeraldResult RootHeraldCollectLocalPosture(_Out_ RootHeraldPosture* out_posture);
+ROOTHERALD_API void RootHeraldFreeEvidence(_In_opt_ char* evidence_json);
 
 } /* extern "C" */
 

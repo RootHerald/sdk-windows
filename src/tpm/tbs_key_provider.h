@@ -1,19 +1,20 @@
-/**
- * TbsKeyProvider — the attestation key (AK) lifecycle and credential
- * activation, backed by raw TPM 2.0 commands over TBS. It is the only AK
- * backend on Windows, so it is a concrete class rather than an implementation
- * of an interface.
+/*
+ * Attestation-key lifecycle and credential activation over raw TPM 2.0/TBS.
  *
- * Credential activation uses TPM2_ActivateCredential directly, which
- * Windows TBS only permits for an elevated caller, so enrollment runs under one
- * UAC. The AK is evicted to a persistent handle so it survives reboots and is
- * reachable from any TBS context (incl. the unprivileged attestation process)
- * for TPM2_Quote.
+ * ELEVATION: ActivateCredential requires an elevated process, so enrollment
+ * runs under one UAC. The AK is then evicted to a persistent handle, which
+ * survives reboots and is reachable from any TBS context — including an
+ * unprivileged one — so attestation never elevates again.
+ *
+ * LIFETIME: CreateAk leaves transient EK and AK handles open in this object's
+ * TBS context, and ActivateCredential needs them. The instance must therefore
+ * outlive the relayed enroll round-trip; LoadAk cannot rebuild them.
  */
 
-#ifndef ROOTHERALD_TBS_KEY_PROVIDER_H
-#define ROOTHERALD_TBS_KEY_PROVIDER_H
+#pragma once
 
+#include <windows.h>
+#include <sal.h>
 #include <cstdint>
 #include <vector>
 
@@ -27,56 +28,54 @@ public:
         : _persistentHandle(persistentHandle) {}
     ~TbsKeyProvider();
 
-    /// Short identifier ("tbs"), used for logging.
-    const char* ModeName() const { return "tbs"; }
+    TbsKeyProvider(const TbsKeyProvider&) = delete;
+    TbsKeyProvider& operator=(const TbsKeyProvider&) = delete;
 
-    /// Acquire the TBS context. False if the backend is unavailable.
-    bool Open();
+    _Ret_z_ const char* ModeName() const { return "tbs"; }
+
+    HRESULT Open();
     void Close();
 
-    /// True if a persisted AK already exists for this device.
     bool AkExists();
 
-    /// Create a fresh attestation key, replacing any existing one. The new key
-    /// is held open for the subsequent GetAkPublicArea / ActivateCredential /
-    /// PersistAk calls.
-    bool CreateAk();
+    /* Replaces any existing key. The new one is held open for the following
+     * GetAkPublicArea / ActivateCredential / PersistAk calls. */
+    HRESULT CreateAk();
 
-    /// Open the already-persisted AK for attestation. False if absent.
-    bool LoadAk();
+    /* Confirms the persisted AK is present; the persistent handle needs no
+     * transient slot, so there is nothing else to load. */
+    HRESULT LoadAk();
 
-    /// Drop the transient handles left by a failed enrollment. Idempotent.
-    bool DeleteAk();
+    /* Drops transient handles left by a failed enrollment. Idempotent. The
+     * persistent slot is not cleared: PersistAk overwrites it. */
+    HRESULT DeleteAk();
 
-    /// The created AK's TPM2B_PUBLIC (size-prefixed), for the server to compute
-    /// the AK Name. Empty on error.
-    std::vector<uint8_t> GetAkPublicArea();
+    /* TPM2B_PUBLIC of the created AK, from which the server computes the AK
+     * Name. Empty until CreateAk succeeds. */
+    std::vector<uint8_t> GetAkPublicArea() const;
 
-    /// Recover the credential secret from the server's MakeCredential output
-    /// (full TPM2B_ID_OBJECT and TPM2B_ENCRYPTED_SECRET) via
-    /// TPM2_ActivateCredential, which needs elevation. Empty on failure.
-    std::vector<uint8_t> ActivateCredential(
-        const std::vector<uint8_t>& credentialBlob,
-        const std::vector<uint8_t>& encryptedSecret);
+    /* credentialBlob and encryptedSecret are the server's MakeCredential
+     * outputs, already TPM2B-framed. out_secret holds recovered TPM secret
+     * material: clear it with SecureZeroMemory once consumed. */
+    _Success_(return == S_OK)
+    HRESULT ActivateCredential(const std::vector<uint8_t>& credentialBlob,
+                               const std::vector<uint8_t>& encryptedSecret,
+                               _Out_ std::vector<uint8_t>* out_secret);
 
-    /// Evict the freshly-activated AK to the persistent handle so future
-    /// attestations can load it.
-    bool PersistAk();
+    HRESULT PersistAk();
 
-    /// The raw TPM handle to feed TpmCommands::Quote — the persistent handle,
-    /// valid across TBS contexts.
-    uint32_t GetQuoteHandle();
+    /* The handle to feed TpmCommands::Quote — persistent, so it stays valid
+     * across TBS contexts and processes. */
+    uint32_t GetQuoteHandle() const;
 
 private:
     void FlushTransients();
 
     TpmCommands _tpm;
     uint32_t _persistentHandle;
-    uint32_t _ekHandle = 0;       // transient, set by CreateAk
-    uint32_t _akHandle = 0;       // transient, set by CreateAk
-    std::vector<uint8_t> _akPubArea;
+    uint32_t _ekHandle = 0;
+    uint32_t _akHandle = 0;
+    std::vector<uint8_t> _akPublicArea;
 };
 
 } // namespace RootHerald
-
-#endif /* ROOTHERALD_TBS_KEY_PROVIDER_H */

@@ -1,19 +1,10 @@
-/**
- * Secure Boot Chain Validator — Implementation
- *
- * Parses EFI_SIGNATURE_LIST structures from Secure Boot variable data,
- * extracts X.509 certificates, and validates them against known
- * Microsoft and OEM certificate thumbprints.
- *
- * EFI_SIGNATURE_LIST format:
- *   SignatureType (GUID, 16 bytes)
- *   SignatureListSize (4 bytes)
- *   SignatureHeaderSize (4 bytes)
- *   SignatureSize (4 bytes)
- *   SignatureHeader[SignatureHeaderSize]
- *   Signatures[]:
- *     SignatureOwner (GUID, 16 bytes)
- *     SignatureData[SignatureSize - 16]  // X.509 DER cert for EFI_CERT_X509_GUID
+/*
+ * EFI_SIGNATURE_LIST layout, as it appears inside a PCR[7] variable event:
+ *   SignatureType(GUID,16) SignatureListSize(4) SignatureHeaderSize(4)
+ *   SignatureSize(4) SignatureHeader[SignatureHeaderSize]
+ *   Signatures[]: SignatureOwner(GUID,16) SignatureData[SignatureSize-16]
+ * SignatureData is a DER X.509 certificate when SignatureType is
+ * EFI_CERT_X509_GUID.
  */
 
 #include "secureboot_validator.h"
@@ -21,42 +12,33 @@
 
 #include <windows.h>
 #include <wincrypt.h>
+#include <sal.h>
 #include <cstring>
 #include <algorithm>
+
+#include "unique_handle.h"
 
 #pragma comment(lib, "crypt32.lib")
 
 namespace RootHerald {
 
-// EFI GUIDs
 static const uint8_t EFI_CERT_X509_GUID[] = {
     0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
     0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72
 };
 
-// Known Microsoft certificate SHA-256 thumbprints (of the DER-encoded certificate)
-// These are the certificates that MUST be in the Secure Boot db/KEK for a legitimate Windows boot.
-
-// Microsoft Corporation UEFI CA 2011
-// Subject: CN=Microsoft Corporation UEFI CA 2011, O=Microsoft Corporation, L=Redmond, S=Washington, C=US
+/* SHA-256 of the DER-encoded certificate, for the certificates a legitimate
+ * Windows boot chain carries in db/KEK. */
 static const char* MS_UEFI_CA_2011_THUMBPRINT =
     "46DEF63B5CE61CF8BA0DE2E6639C1019D0ED14F3D65B68D78BA2B0461D4C2D65";
-
-// Microsoft Windows Production PCA 2011
-// Subject: CN=Microsoft Windows Production PCA 2011, O=Microsoft Corporation, L=Redmond, S=Washington, C=US
 static const char* MS_WIN_PCA_2011_THUMBPRINT =
     "580A6F4CC4E4B669B9EBDC1B2B3E087B80D0678D5E2A7BC341A0DC4B50BF2E27";
-
-// Microsoft Corporation KEK CA 2011
-// Subject: CN=Microsoft Corporation KEK CA 2011, O=Microsoft Corporation, L=Redmond, S=Washington, C=US
 static const char* MS_KEK_CA_2011_THUMBPRINT =
     "31590BFD89C9D74ED087DFAC6637B34BCA2028A586CA9CF9B79EF23B2C27A4A8";
-
-// Microsoft UEFI CA 2023
 static const char* MS_UEFI_CA_2023_THUMBPRINT =
     "45A0FA32604773C82433C3B7D59E7466B3AC0C7CEEE2B40EA4EE0E14A0925F28";
 
-// Known OEM Platform Key issuers
+/* Substrings matched against a Platform Key's subject or issuer. */
 static const char* KNOWN_OEM_NAMES[] = {
     "Lenovo", "LENOVO",
     "Dell", "DELL",
@@ -82,16 +64,16 @@ static const char* KNOWN_OEM_NAMES[] = {
     nullptr
 };
 
-static uint16_t ReadU16LE(const uint8_t* p) { return p[0] | (p[1] << 8); }
-static uint32_t ReadU32LE(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
+static uint16_t ReadU16LE(_In_reads_bytes_(2) const uint8_t* p) { return p[0] | (p[1] << 8); }
+static uint32_t ReadU32LE(_In_reads_bytes_(4) const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
 
-static std::string BytesToHexUpper(const uint8_t* data, size_t len) {
-    static const char hex[] = "0123456789ABCDEF";
+static std::string BytesToHexUpper(_In_reads_bytes_(len) const uint8_t* data, size_t len) {
+    static const char HEX[] = "0123456789ABCDEF";
     std::string result;
     result.reserve(len * 2);
     for (size_t i = 0; i < len; i++) {
-        result += hex[data[i] >> 4];
-        result += hex[data[i] & 0x0F];
+        result += HEX[data[i] >> 4];
+        result += HEX[data[i] & 0x0F];
     }
     return result;
 }
@@ -101,56 +83,45 @@ static std::string ToUpper(std::string s) {
     return s;
 }
 
-/// Compute SHA-256 thumbprint of a DER-encoded certificate.
-static std::string CertThumbprint(const uint8_t* derData, size_t derLen) {
-    HCRYPTPROV hProv = 0;
-    HCRYPTHASH hHash = 0;
-    std::string result;
-
-    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+static std::string CertThumbprint(_In_reads_bytes_(derLen) const uint8_t* derData, size_t derLen) {
+    UniqueCryptProv provider;
+    if (!CryptAcquireContextW(provider.Put(), nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
         return "";
 
-    if (CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-        if (CryptHashData(hHash, derData, (DWORD)derLen, 0)) {
-            BYTE hash[32];
-            DWORD hashLen = 32;
-            if (CryptGetHashParam(hHash, HP_HASHVAL, hash, &hashLen, 0)) {
-                result = BytesToHexUpper(hash, 32);
-            }
-        }
-        CryptDestroyHash(hHash);
-    }
-    CryptReleaseContext(hProv, 0);
-    return result;
+    UniqueCryptHash hash;
+    if (!CryptCreateHash(provider.Get(), CALG_SHA_256, 0, 0, hash.Put()))
+        return "";
+
+    if (!CryptHashData(hash.Get(), derData, (DWORD)derLen, 0)) return "";
+
+    BYTE digest[32];
+    DWORD digestLen = 32;
+    if (!CryptGetHashParam(hash.Get(), HP_HASHVAL, digest, &digestLen, 0)) return "";
+
+    return BytesToHexUpper(digest, 32);
 }
 
-/// Extract subject/issuer from a DER certificate using Windows CryptoAPI.
-static CertInfo ParseDerCertificate(const uint8_t* derData, size_t derLen) {
+static CertInfo ParseDerCertificate(_In_reads_bytes_(derLen) const uint8_t* derData, size_t derLen) {
     CertInfo info;
 
-    PCCERT_CONTEXT ctx = CertCreateCertificateContext(
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, derData, (DWORD)derLen);
-
+    UniqueCertContext ctx(CertCreateCertificateContext(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, derData, (DWORD)derLen));
     if (!ctx) return info;
 
-    // Subject
     char subject[512] = {};
-    CertNameToStrA(X509_ASN_ENCODING, &ctx->pCertInfo->Subject,
+    CertNameToStrA(X509_ASN_ENCODING, &ctx.Get()->pCertInfo->Subject,
                    CERT_X500_NAME_STR | CERT_NAME_STR_REVERSE_FLAG,
                    subject, sizeof(subject));
     info.subject = subject;
 
-    // Issuer
     char issuer[512] = {};
-    CertNameToStrA(X509_ASN_ENCODING, &ctx->pCertInfo->Issuer,
+    CertNameToStrA(X509_ASN_ENCODING, &ctx.Get()->pCertInfo->Issuer,
                    CERT_X500_NAME_STR | CERT_NAME_STR_REVERSE_FLAG,
                    issuer, sizeof(issuer));
     info.issuer = issuer;
 
-    // Thumbprint
     info.thumbprintSha256 = CertThumbprint(derData, derLen);
 
-    // Check if Microsoft cert
     std::string thumbUpper = ToUpper(info.thumbprintSha256);
     if (thumbUpper == MS_UEFI_CA_2011_THUMBPRINT ||
         thumbUpper == MS_WIN_PCA_2011_THUMBPRINT ||
@@ -158,12 +129,10 @@ static CertInfo ParseDerCertificate(const uint8_t* derData, size_t derLen) {
         thumbUpper == MS_UEFI_CA_2023_THUMBPRINT) {
         info.isMicrosoftCert = true;
     }
-    // Also check by subject name
     if (info.subject.find("Microsoft") != std::string::npos) {
         info.isMicrosoftCert = true;
     }
 
-    // Check if known OEM
     for (int i = 0; KNOWN_OEM_NAMES[i]; i++) {
         if (info.subject.find(KNOWN_OEM_NAMES[i]) != std::string::npos ||
             info.issuer.find(KNOWN_OEM_NAMES[i]) != std::string::npos) {
@@ -173,16 +142,12 @@ static CertInfo ParseDerCertificate(const uint8_t* derData, size_t derLen) {
         }
     }
 
-    CertFreeCertificateContext(ctx);
     return info;
 }
 
 std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData) {
     std::vector<CertInfo> certs;
 
-    // EFI variable event format:
-    // EFI_GUID VariableName(16) + UnicodeNameLength(8) + VariableDataLength(8) +
-    // UnicodeName[UnicodeNameLength] + VariableData[VariableDataLength]
     if (variableData.size() < 32) return certs;
 
     uint64_t nameLen = 0, dataLen = 0;
@@ -195,8 +160,7 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
     const uint8_t* sigListData = variableData.data() + dataOffset;
     size_t sigListRemaining = (size_t)dataLen;
 
-    // Parse EFI_SIGNATURE_LIST entries
-    while (sigListRemaining >= 28) { // Minimum: GUID(16) + 3*uint32(12)
+    while (sigListRemaining >= 28) { // GUID(16) + 3 * uint32
         const uint8_t* sigType = sigListData;
         uint32_t listSize = ReadU32LE(sigListData + 16);
         uint32_t headerSize = ReadU32LE(sigListData + 20);
@@ -204,17 +168,16 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
 
         if (listSize == 0 || listSize > sigListRemaining) break;
 
-        // Check if this is an X.509 certificate list
         bool isX509 = memcmp(sigType, EFI_CERT_X509_GUID, 16) == 0;
 
         if (isX509 && sigSize > 16) {
-            // Each signature: SignatureOwner(16) + SignatureData(sigSize-16)
-            size_t offset = 28 + headerSize; // Past the list header
-            while (offset + sigSize <= 28 + listSize - 28 + 28 && offset + sigSize <= listSize) {
-                // Recalculate: entries start after the list header (28 bytes + headerSize)
+            // Entries begin after the list header and its optional extra
+            // header; each is SignatureOwner(16) + SignatureData.
+            size_t offset = 28 + headerSize;
+            while (offset + sigSize <= listSize) {
                 const uint8_t* sigEntry = sigListData + offset;
                 size_t certLen = sigSize - 16;
-                const uint8_t* certData = sigEntry + 16; // Skip SignatureOwner GUID
+                const uint8_t* certData = sigEntry + 16;
 
                 if (certLen > 0 && certLen < 65536) {
                     auto certInfo = ParseDerCertificate(certData, certLen);
@@ -234,7 +197,6 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
     return certs;
 }
 
-/// Extract the EFI variable name from event data
 static std::string ExtractVarName(const std::vector<uint8_t>& data) {
     if (data.size() < 32) return "";
     uint64_t nameLen = 0;
@@ -253,11 +215,9 @@ static std::string ExtractVarName(const std::vector<uint8_t>& data) {
 SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEventLog) {
     SecureBootChainReport report;
 
-    // First, parse the event log to get PCR[7] entries
     auto analysis = ParseAndAnalyzeEventLog(rawEventLog);
     report.secureBootEnabled = analysis.secureBootEnabled;
 
-    // Process each PCR[7] event
     for (const auto& entry : analysis.entries) {
         if (entry.pcrIndex != 7) continue;
         if (entry.eventType != EV_EFI_VARIABLE_DRIVER_CONFIG &&
@@ -286,7 +246,7 @@ SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEve
         else if (varName == "db") {
             report.dbCerts = certs;
             for (const auto& c : certs) {
-                // Match by subject name (thumbprints may differ due to DER encoding variations)
+                // Matched by subject: DER encoding variations move thumbprints.
                 if (c.subject.find("Microsoft Corporation UEFI CA 2011") != std::string::npos)
                     report.dbHasMicrosoftUefiCa2011 = true;
                 if (c.subject.find("Microsoft UEFI CA 2023") != std::string::npos ||
@@ -297,13 +257,12 @@ SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEve
             }
         }
         else if (varName == "dbx") {
-            // dbx can contain SHA-256 hash lists, not necessarily X.509 certs
-            // Count the entries
-            report.dbxHashCount = (int)certs.size(); // Rough count
+            // dbx mostly holds SHA-256 hash lists rather than X.509 certs, so
+            // this counts only the parseable certificate entries.
+            report.dbxHashCount = (int)certs.size();
         }
     }
 
-    // Generate validation verdict
     if (!report.secureBootEnabled) {
         report.errors.push_back("Secure Boot is DISABLED");
         report.verdict = "FAIL: Secure Boot disabled";
@@ -331,7 +290,6 @@ SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEve
             "only Microsoft-signed boot components are trusted on standard systems");
     }
 
-    // Final verdict
     if (!report.errors.empty()) {
         report.chainValid = false;
         report.verdict = "FAIL: " + report.errors[0];

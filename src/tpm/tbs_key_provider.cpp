@@ -1,23 +1,30 @@
-/**
- * TbsKeyProvider implementation. See tbs_key_provider.h.
- */
-
 #include "tbs_key_provider.h"
-#include <cstdio>
+
 #include "log.h"
+#include "win_status.h"
 
 namespace RootHerald {
 
-static constexpr uint32_t kTpmRhOwner = 0x40000001u;
+namespace {
+constexpr uint32_t TPM_RH_OWNER = 0x40000001u;
+}
 
 TbsKeyProvider::~TbsKeyProvider() { Close(); }
 
-bool TbsKeyProvider::Open() { return _tpm.Open(); }
+HRESULT TbsKeyProvider::Open() { return _tpm.Open(); }
 
 void TbsKeyProvider::FlushTransients()
 {
-    if (_akHandle) { _tpm.FlushContext(_akHandle); _akHandle = 0; }
-    if (_ekHandle) { _tpm.FlushContext(_ekHandle); _ekHandle = 0; }
+    if (_akHandle) {
+        HRESULT hr = _tpm.FlushContext(_akHandle);
+        if (FAILED(hr)) RH_LOG_DEBUG("[tbs] FlushContext(AK): 0x%08X\n", (unsigned)hr);
+        _akHandle = 0;
+    }
+    if (_ekHandle) {
+        HRESULT hr = _tpm.FlushContext(_ekHandle);
+        if (FAILED(hr)) RH_LOG_DEBUG("[tbs] FlushContext(EK): 0x%08X\n", (unsigned)hr);
+        _ekHandle = 0;
+    }
 }
 
 void TbsKeyProvider::Close()
@@ -31,76 +38,74 @@ bool TbsKeyProvider::AkExists()
     return _tpm.IsPersistentPresent(_persistentHandle);
 }
 
-bool TbsKeyProvider::CreateAk()
+HRESULT TbsKeyProvider::CreateAk()
 {
     FlushTransients();
-    _akPubArea.clear();
+    _akPublicArea.clear();
 
-    // EK (transient, L-1 template) — used as the decrypt key for activation.
-    // Its key is deterministic and matches PCP_EKPUB, so the server can
-    // encrypt the seed to PCP_EKPUB and this handle will decrypt it.
-    _ekHandle = _tpm.CreateEk();
-    if (!_ekHandle) {
-        RH_LOG_WARN("[tbs] CreateEk failed\n");
-        return false;
+    // The EK is the decrypt key for activation: its key is deterministic and
+    // matches PCP_EKPUB, so a seed the server sealed to PCP_EKPUB opens here.
+    HRESULT hr = _tpm.CreateEk(&_ekHandle);
+    if (FAILED(hr) || !_ekHandle) {
+        RH_LOG_WARN("[tbs] CreateEk failed: 0x%08X\n", (unsigned)hr);
+        return FAILED(hr) ? hr : E_FAIL;
     }
 
-    // AK (transient, restricted RSA signing key under the owner hierarchy).
-    _akHandle = _tpm.CreateAndLoadAk(kTpmRhOwner, &_akPubArea);
-    if (!_akHandle || _akPubArea.empty()) {
-        RH_LOG_WARN("[tbs] CreateAndLoadAk failed\n");
+    hr = _tpm.CreateAndLoadAk(TPM_RH_OWNER, &_akHandle, &_akPublicArea);
+    if (FAILED(hr) || !_akHandle || _akPublicArea.empty()) {
+        RH_LOG_WARN("[tbs] CreateAndLoadAk failed: 0x%08X\n", (unsigned)hr);
         FlushTransients();
-        return false;
+        return FAILED(hr) ? hr : E_FAIL;
     }
-    return true;
+    return S_OK;
 }
 
-bool TbsKeyProvider::LoadAk()
+HRESULT TbsKeyProvider::LoadAk()
 {
-    // The AK lives at the persistent handle; nothing to load into a transient
-    // slot. Presence at the handle is sufficient for Quote.
-    return _tpm.IsPersistentPresent(_persistentHandle);
+    return _tpm.IsPersistentPresent(_persistentHandle) ? S_OK : E_FAIL;
 }
 
-bool TbsKeyProvider::DeleteAk()
+HRESULT TbsKeyProvider::DeleteAk()
 {
-    // Drop any transient handles. The persistent slot is overwritten on the
-    // next PersistAk (EvictControl clears an occupied slot first), so a stale
-    // persistent AK does not block a fresh enrollment / rotation.
     FlushTransients();
-    return true;
+    return S_OK;
 }
 
-std::vector<uint8_t> TbsKeyProvider::GetAkPublicArea()
+std::vector<uint8_t> TbsKeyProvider::GetAkPublicArea() const
 {
-    return _akPubArea;
+    return _akPublicArea;
 }
 
-std::vector<uint8_t> TbsKeyProvider::ActivateCredential(
-    const std::vector<uint8_t>& credentialBlob,
-    const std::vector<uint8_t>& encryptedSecret)
+_Use_decl_annotations_
+HRESULT TbsKeyProvider::ActivateCredential(const std::vector<uint8_t>& credentialBlob,
+                                           const std::vector<uint8_t>& encryptedSecret,
+                                           std::vector<uint8_t>* out_secret)
 {
+    out_secret->clear();
     if (!_akHandle || !_ekHandle) {
         RH_LOG_WARN("[tbs] ActivateCredential called before CreateAk\n");
-        return {};
+        return RH_E_NOT_OPEN;
     }
-    return _tpm.ActivateCredential(_akHandle, _ekHandle, credentialBlob, encryptedSecret);
+    return _tpm.ActivateCredential(_akHandle, _ekHandle, credentialBlob, encryptedSecret, out_secret);
 }
 
-bool TbsKeyProvider::PersistAk()
+HRESULT TbsKeyProvider::PersistAk()
 {
-    if (!_akHandle) return false;
-    if (!_tpm.EvictControl(_akHandle, _persistentHandle)) {
-        RH_LOG_WARN("[tbs] EvictControl(AK -> 0x%08X) failed\n", _persistentHandle);
-        return false;
+    if (!_akHandle) return RH_E_NOT_OPEN;
+
+    HRESULT hr = _tpm.EvictControl(_akHandle, _persistentHandle);
+    if (FAILED(hr)) {
+        RH_LOG_WARN("[tbs] EvictControl(AK -> 0x%08X) failed: 0x%08X\n",
+                    _persistentHandle, (unsigned)hr);
+        return hr;
     }
-    // The persistent copy is now the durable AK; transients are no longer
-    // needed (and Quote uses the persistent handle, valid across contexts).
+
+    // Quote uses the persistent handle from here on, so the transients are dead.
     FlushTransients();
-    return true;
+    return S_OK;
 }
 
-uint32_t TbsKeyProvider::GetQuoteHandle()
+uint32_t TbsKeyProvider::GetQuoteHandle() const
 {
     return _persistentHandle;
 }
