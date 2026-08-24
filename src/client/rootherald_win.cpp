@@ -101,17 +101,24 @@ static std::vector<uint8_t> BcryptDigest(_In_z_ LPCWSTR algorithmId,
         return out;
 
     DWORD digestLen = 0, resultLen = 0;
-    BCryptGetProperty(algorithm.Get(), BCRYPT_HASH_LENGTH,
-                      (PUCHAR)&digestLen, sizeof(digestLen), &resultLen, 0);
+    if (BCryptGetProperty(algorithm.Get(), BCRYPT_HASH_LENGTH,
+                          (PUCHAR)&digestLen, sizeof(digestLen), &resultLen, 0) != 0)
+        return out;
     if (digestLen == 0) return out;
 
     RootHerald::UniqueBcryptHash hash;
-    if (BCryptCreateHash(algorithm.Get(), hash.Put(), nullptr, 0, nullptr, 0, 0) == 0) {
-        if (BCryptHashData(hash.Get(), (PUCHAR)data, (ULONG)len, 0) == 0) {
-            out.resize(digestLen);
-            BCryptFinishHash(hash.Get(), out.data(), digestLen, 0);
-        }
-    }
+    if (BCryptCreateHash(algorithm.Get(), hash.Put(), nullptr, 0, nullptr, 0, 0) != 0)
+        return out;
+    if (BCryptHashData(hash.Get(), (PUCHAR)data, (ULONG)len, 0) != 0)
+        return out;
+
+    /* An empty vector is the only signal a caller gets, so a failed finish must
+     * clear it: a zeroed buffer of the right length is indistinguishable from a
+     * real digest and would feed device-id derivation and the certificate
+     * dedupe as if it were one. */
+    out.resize(digestLen);
+    if (BCryptFinishHash(hash.Get(), out.data(), digestLen, 0) != 0)
+        out.clear();
     return out;
 }
 

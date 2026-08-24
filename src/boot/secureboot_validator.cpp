@@ -4,7 +4,7 @@
  *   SignatureSize(4) SignatureHeader[SignatureHeaderSize]
  *   Signatures[]: SignatureOwner(GUID,16) SignatureData[SignatureSize-16]
  * SignatureData is a DER X.509 certificate when SignatureType is
- * EFI_CERT_X509_GUID.
+ * EFI_CERT_X509_GUID, and a bare SHA-256 digest when it is EFI_CERT_SHA256_GUID.
  */
 
 #include "secureboot_validator.h"
@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 #include <sal.h>
+#include <climits>
 #include <cstring>
 #include <algorithm>
 
@@ -26,6 +27,11 @@ namespace RootHerald {
 static const uint8_t EFI_CERT_X509_GUID[] = {
     0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
     0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72
+};
+
+static const uint8_t EFI_CERT_SHA256_GUID[] = {
+    0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40,
+    0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93, 0x43, 0x28
 };
 
 /* SHA-256 of the DER-encoded certificate, for the certificates a legitimate
@@ -194,8 +200,11 @@ static CertInfo ParseDerCertificate(_In_reads_bytes_(derLen) const uint8_t* derD
     return info;
 }
 
-std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData) {
+std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData,
+                                            int* out_sha256Count) {
     std::vector<CertInfo> certs;
+    size_t sha256Entries = 0;
+    if (out_sha256Count) *out_sha256Count = 0;
 
     EfiVariableData var;
     if (!TryParseEfiVariableData(variableData, &var)) return certs;
@@ -212,11 +221,15 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
         if (listSize == 0 || listSize > sigListRemaining) break;
 
         bool isX509 = memcmp(sigType, EFI_CERT_X509_GUID, 16) == 0;
+        bool isSha256 = memcmp(sigType, EFI_CERT_SHA256_GUID, 16) == 0;
+
+        // Entries begin after the list header and its optional extra header;
+        // each is SignatureOwner(16) + SignatureData. headerSize is widened to
+        // size_t so the offset cannot wrap before it is compared.
+        const size_t entriesOffset = 28 + (size_t)headerSize;
 
         if (isX509 && sigSize > 16) {
-            // Entries begin after the list header and its optional extra
-            // header; each is SignatureOwner(16) + SignatureData.
-            size_t offset = 28 + headerSize;
+            size_t offset = entriesOffset;
             while (offset + sigSize <= listSize) {
                 const uint8_t* sigEntry = sigListData + offset;
                 size_t certLen = sigSize - 16;
@@ -232,11 +245,19 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
                 offset += sigSize;
             }
         }
+        else if (isSha256 && sigSize > 16 && entriesOffset < listSize) {
+            // Fixed-size entries, so the count is arithmetic rather than a
+            // walk. This is what a revocation list actually holds: dbx is a few
+            // hundred digests and typically no certificate at all.
+            sha256Entries += (listSize - entriesOffset) / sigSize;
+        }
 
         sigListData += listSize;
         sigListRemaining -= listSize;
     }
 
+    if (out_sha256Count)
+        *out_sha256Count = (sha256Entries > (size_t)INT_MAX) ? INT_MAX : (int)sha256Entries;
     return certs;
 }
 
@@ -258,7 +279,8 @@ SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEve
             entry.eventType != EV_EFI_VARIABLE_BOOT) continue;
 
         std::string varName = ExtractVarName(entry.eventData);
-        auto certs = ParseEfiSignatureList(entry.eventData);
+        int sha256Count = 0;
+        auto certs = ParseEfiSignatureList(entry.eventData, &sha256Count);
 
         if (varName == "PK") {
             report.pkCerts = certs;
@@ -291,9 +313,7 @@ SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEve
             }
         }
         else if (varName == "dbx") {
-            // dbx mostly holds SHA-256 hash lists rather than X.509 certs, so
-            // this counts only the parseable certificate entries.
-            report.dbxHashCount = (int)certs.size();
+            report.dbxHashCount = sha256Count;
         }
     }
 
