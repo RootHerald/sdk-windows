@@ -34,11 +34,6 @@ static const uint8_t EFI_CERT_X509_GUID[] = {
     0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72
 };
 
-static const uint8_t EFI_CERT_SHA256_GUID[] = {
-    0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40,
-    0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93, 0x43, 0x28
-};
-
 // Known Microsoft certificate SHA-256 thumbprints (of the DER-encoded certificate)
 // These are the certificates that MUST be in the Secure Boot db/KEK for a legitimate Windows boot.
 
@@ -211,7 +206,6 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
 
         // Check if this is an X.509 certificate list
         bool isX509 = memcmp(sigType, EFI_CERT_X509_GUID, 16) == 0;
-        bool isSha256 = memcmp(sigType, EFI_CERT_SHA256_GUID, 16) == 0;
 
         if (isX509 && sigSize > 16) {
             // Each signature: SignatureOwner(16) + SignatureData(sigSize-16)
