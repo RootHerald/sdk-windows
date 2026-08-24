@@ -217,7 +217,8 @@ typedef enum {
     ROOTHERALD_LOG_ERROR = 0,
     ROOTHERALD_LOG_WARN  = 1,
     ROOTHERALD_LOG_INFO  = 2,
-    ROOTHERALD_LOG_DEBUG = 3
+    ROOTHERALD_LOG_DEBUG = 3,
+    ROOTHERALD_LOG_TRACE = 4
 } RootHeraldLogLevel;
 
 typedef void (*RootHeraldLogCallback)(
