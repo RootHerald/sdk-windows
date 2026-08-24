@@ -1,13 +1,12 @@
-/**
- * TCG Event Log Parser — Detailed analysis of boot measurements.
+/*
+ * Structured view of the TCG event log: one entry per measurement, classified
+ * and given a human-readable description.
  *
- * Parses the Windows TCG event log into structured entries,
- * classifying each measurement by type and extracting human-readable
- * descriptions. This is the foundation for bootkit detection.
+ * Descriptive only. The verdict fields are advisory client-side observations;
+ * the server re-derives boot posture from the quote-bound log.
  */
 
-#ifndef ROOTHERALD_EVENT_LOG_PARSER_H
-#define ROOTHERALD_EVENT_LOG_PARSER_H
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -16,7 +15,7 @@
 
 namespace RootHerald {
 
-// TCG Event Types (TCG PC Client Spec)
+/* TCG PC Client Platform Firmware Profile event types. */
 enum EventType : uint32_t {
     EV_PREBOOT_CERT           = 0x00000000,
     EV_POST_CODE              = 0x00000001,
@@ -38,7 +37,6 @@ enum EventType : uint32_t {
     EV_NONHOST_INFO           = 0x00000011,
     EV_OMIT_BOOT_DEVICE_EVENTS = 0x00000012,
 
-    // EFI Events
     EV_EFI_EVENT_BASE                = 0x80000000,
     EV_EFI_VARIABLE_DRIVER_CONFIG    = 0x80000001,
     EV_EFI_VARIABLE_BOOT             = 0x80000002,
@@ -62,10 +60,10 @@ struct EventLogEntry {
     uint32_t pcrIndex;
     uint32_t eventType;
     std::string eventTypeName;
-    std::map<uint16_t, std::vector<uint8_t>> digests; // algId -> digest
+    std::map<uint16_t, std::vector<uint8_t>> digests; // TPM algorithm id -> digest
     std::vector<uint8_t> eventData;
-    std::string description;  // Human-readable description
-    std::string classification; // "verified", "unknown", "policy"
+    std::string description;
+    std::string classification;   // "verified" | "unknown" | "policy"
 };
 
 struct EventLogAnalysis {
@@ -75,16 +73,14 @@ struct EventLogAnalysis {
     int verifiedCount = 0;
     int unknownCount = 0;
     int policyCount = 0;
-    std::string verdict; // "PASS", "FAIL", "WARNING"
+    std::string verdict;          // "PASS" | "FAIL" | "WARNING"
     std::string verdictReason;
 };
 
-/// Parse a raw TCG event log into structured entries.
+/* Stops at the first truncated entry; a partial entry is discarded. */
 EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog);
 
-/// Get human-readable name for an event type.
+/* Static string, never NULL; "UNKNOWN" for an unrecognised type. */
 const char* EventTypeName(uint32_t eventType);
 
 } // namespace RootHerald
-
-#endif /* ROOTHERALD_EVENT_LOG_PARSER_H */

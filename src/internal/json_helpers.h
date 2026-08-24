@@ -1,18 +1,18 @@
-/**
- * Minimal JSON helpers for the  Root Herald client SDK.
- * Handles only the flat object structures needed for the attestation protocol.
- * Not a general-purpose JSON library.
+/*
+ * Flat-object JSON build/read for the attestation protocol only. Not a
+ * general-purpose JSON library, and deliberately not a dependency.
  */
 
-#ifndef ROOTHERALD_JSON_HELPERS_H
-#define ROOTHERALD_JSON_HELPERS_H
+#pragma once
 
 #include <string>
 #include <map>
 
 namespace RootHerald {
 
-/// Build a flat JSON object from string key-value pairs.
+/* A value already starting with '{' or '[', or spelling true/false/null, is
+ * embedded verbatim; anything else is escaped and quoted. That is how callers
+ * splice a pre-built array such as ekCertificateChain into the object. */
 inline std::string JsonBuild(const std::map<std::string, std::string>& fields)
 {
     std::string json = "{";
@@ -22,11 +22,9 @@ inline std::string JsonBuild(const std::map<std::string, std::string>& fields)
         first = false;
         json += "\"" + key + "\":";
 
-        // Check if value is already JSON (object/array) or a raw value
         if (!value.empty() && (value[0] == '{' || value[0] == '[' || value == "true" || value == "false" || value == "null")) {
             json += value;
         } else {
-            // Escape and quote as string
             json += "\"";
             for (char c : value) {
                 if (c == '"') json += "\\\"";
@@ -41,9 +39,7 @@ inline std::string JsonBuild(const std::map<std::string, std::string>& fields)
     return json;
 }
 
-/// Extract a string value from a flat JSON object by key.
-/// Returns empty string if not found. Very simple parser — handles the shapes
-/// returned by the  Root Herald API.
+/* Empty string when the key is absent. */
 inline std::string JsonGet(const std::string& json, const std::string& key)
 {
     std::string search = "\"" + key + "\"";
@@ -54,13 +50,10 @@ inline std::string JsonGet(const std::string& json, const std::string& key)
     if (pos == std::string::npos) return "";
     pos++;
 
-    // Skip whitespace
     while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-
     if (pos >= json.size()) return "";
 
     if (json[pos] == '"') {
-        // String value
         pos++;
         std::string result;
         while (pos < json.size() && json[pos] != '"') {
@@ -74,24 +67,22 @@ inline std::string JsonGet(const std::string& json, const std::string& key)
             pos++;
         }
         return result;
-    } else {
-        // Number, bool, null, or nested object
-        size_t start = pos;
-        int depth = 0;
-        while (pos < json.size()) {
-            if (json[pos] == '{' || json[pos] == '[') depth++;
-            else if (json[pos] == '}' || json[pos] == ']') {
-                if (depth == 0) break;
-                depth--;
-            } else if (depth == 0 && (json[pos] == ',' || json[pos] == '}')) {
-                break;
-            }
-            pos++;
-        }
-        return json.substr(start, pos - start);
     }
+
+    // Number, bool, null, or a nested object/array.
+    size_t start = pos;
+    int depth = 0;
+    while (pos < json.size()) {
+        if (json[pos] == '{' || json[pos] == '[') depth++;
+        else if (json[pos] == '}' || json[pos] == ']') {
+            if (depth == 0) break;
+            depth--;
+        } else if (depth == 0 && (json[pos] == ',' || json[pos] == '}')) {
+            break;
+        }
+        pos++;
+    }
+    return json.substr(start, pos - start);
 }
 
 } // namespace RootHerald
-
-#endif /* ROOTHERALD_JSON_HELPERS_H */

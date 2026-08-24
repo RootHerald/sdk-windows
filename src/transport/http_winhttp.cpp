@@ -1,31 +1,32 @@
-/**
- * HTTP transport using WinHTTP — Full implementation.
- */
-
 #include "http_winhttp.h"
 
 #include <windows.h>
 #include <winhttp.h>
+#include <sal.h>
 
 #include <sstream>
 #include <vector>
+
+#include "unique_handle.h"
 
 #pragma comment(lib, "winhttp.lib")
 
 namespace RootHerald {
 
-static HttpResponse DoRequest(const std::string& url, const std::string& verb,
-                               const std::string& body,
-                               const wchar_t* contentTypeHeader = L"Content-Type: application/json")
+namespace {
+
+/* statusCode stays 0 on every pre-response failure; the body then carries a
+ * short JSON diagnostic rather than server content. */
+HttpResponse DoRequest(const std::string& url, const std::string& verb,
+                       const std::string& body,
+                       _In_z_ const wchar_t* contentTypeHeader)
 {
     HttpResponse response;
 
-    // Convert URL to wide string
     int wideLen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
     std::vector<wchar_t> wideUrl(wideLen);
     MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, wideUrl.data(), wideLen);
 
-    // Crack the URL
     URL_COMPONENTS urlComp = {};
     urlComp.dwStructSize = sizeof(urlComp);
 
@@ -43,106 +44,86 @@ static HttpResponse DoRequest(const std::string& url, const std::string& verb,
 
     bool isHttps = (urlComp.nScheme == INTERNET_SCHEME_HTTPS);
 
-    // Open session
-    HINTERNET hSession = WinHttpOpen(
+    UniqueInternet session(WinHttpOpen(
         L"RootHerald/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) {
+        WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) {
         response.body = R"({"error":"WinHttpOpen failed"})";
         return response;
     }
 
-    // Connect
-    HINTERNET hConnect = WinHttpConnect(
-        hSession, hostName, urlComp.nPort, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
+    UniqueInternet connection(WinHttpConnect(session.Get(), hostName, urlComp.nPort, 0));
+    if (!connection) {
         response.body = R"({"error":"WinHttpConnect failed"})";
         return response;
     }
 
-    // Convert verb to wide
     int verbWideLen = MultiByteToWideChar(CP_UTF8, 0, verb.c_str(), -1, nullptr, 0);
     std::vector<wchar_t> wideVerb(verbWideLen);
     MultiByteToWideChar(CP_UTF8, 0, verb.c_str(), -1, wideVerb.data(), verbWideLen);
 
     DWORD flags = isHttps ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, wideVerb.data(), urlPath,
+    UniqueInternet request(WinHttpOpenRequest(
+        connection.Get(), wideVerb.data(), urlPath,
         nullptr, WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
+    if (!request) {
         response.body = R"({"error":"WinHttpOpenRequest failed"})";
         return response;
     }
 
-    // Set Content-Type header
-    WinHttpAddRequestHeaders(hRequest, contentTypeHeader, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+    WinHttpAddRequestHeaders(request.Get(), contentTypeHeader, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
 
-    // Send
-    BOOL result;
+    BOOL sent;
     if (!body.empty()) {
-        result = WinHttpSendRequest(
-            hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            (LPVOID)body.c_str(), (DWORD)body.size(),
+        sent = WinHttpSendRequest(
+            request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            (PVOID)body.c_str(), (DWORD)body.size(),
             (DWORD)body.size(), 0);
     } else {
-        result = WinHttpSendRequest(
-            hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        sent = WinHttpSendRequest(
+            request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     }
 
-    if (!result) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+    if (!sent) {
         response.body = R"({"error":"WinHttpSendRequest failed"})";
         return response;
     }
 
-    // Receive response
-    if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+    if (!WinHttpReceiveResponse(request.Get(), nullptr)) {
         response.body = R"({"error":"WinHttpReceiveResponse failed"})";
         return response;
     }
 
-    // Read status code
     DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hRequest,
+    WinHttpQueryHeaders(request.Get(),
         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize,
         WINHTTP_NO_HEADER_INDEX);
     response.statusCode = (int)statusCode;
 
-    // Read body
     std::ostringstream bodyStream;
     DWORD bytesAvailable = 0;
-    while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
+    while (WinHttpQueryDataAvailable(request.Get(), &bytesAvailable) && bytesAvailable > 0) {
         std::vector<char> buf(bytesAvailable);
         DWORD bytesRead = 0;
-        WinHttpReadData(hRequest, buf.data(), bytesAvailable, &bytesRead);
+        WinHttpReadData(request.Get(), buf.data(), bytesAvailable, &bytesRead);
         bodyStream.write(buf.data(), bytesRead);
     }
     response.body = bodyStream.str();
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-
     return response;
 }
 
+} // namespace
+
 HttpResponse HttpGet(const std::string& url)
 {
-    return DoRequest(url, "GET", "");
+    return DoRequest(url, "GET", "", L"Content-Type: application/json");
 }
 
 } // namespace RootHerald

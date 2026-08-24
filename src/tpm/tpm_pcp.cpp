@@ -1,83 +1,79 @@
-/**
- * NCrypt Platform Crypto Provider wrapper — EK reads. See tpm_pcp.h.
- */
-
 #include "tpm_pcp.h"
-#include <winerror.h>
 
-// PCP provider name
-static const wchar_t* PCP_PROVIDER = L"Microsoft Platform Crypto Provider";
+#include "log.h"
+#include "win_status.h"
 
 namespace RootHerald {
 
-TpmPcp::TpmPcp() = default;
-
-TpmPcp::~TpmPcp() { Close(); }
+namespace {
+constexpr PCWSTR PCP_PROVIDER = L"Microsoft Platform Crypto Provider";
+}
 
 bool TpmPcp::IsAvailable() const
 {
-    NCRYPT_PROV_HANDLE hProv = 0;
-    SECURITY_STATUS status = NCryptOpenStorageProvider(&hProv, PCP_PROVIDER, 0);
-    if (SUCCEEDED(status)) {
-        NCryptFreeObject(hProv);
-        return true;
+    UniqueNcryptProvider probe;
+    SECURITY_STATUS status = NCryptOpenStorageProvider(probe.Put(), PCP_PROVIDER, 0);
+    if (FAILED(status)) {
+        RH_LOG_DEBUG("[pcp] NCryptOpenStorageProvider: 0x%08X\n", (unsigned)status);
+        return false;
     }
-    return false;
+    return true;
 }
 
-bool TpmPcp::Open()
+HRESULT TpmPcp::Open()
 {
-    if (_isOpen) return true;
+    if (_provider) return S_OK;
 
-    SECURITY_STATUS status = NCryptOpenStorageProvider(&_hProvider, PCP_PROVIDER, 0);
-    if (FAILED(status)) return false;
-
-    _isOpen = true;
-    return true;
+    SECURITY_STATUS status = NCryptOpenStorageProvider(_provider.Put(), PCP_PROVIDER, 0);
+    if (FAILED(status)) {
+        RH_LOG_WARN("[pcp] NCryptOpenStorageProvider failed: 0x%08X\n", (unsigned)status);
+        return HrFromSecurityStatus(status);
+    }
+    return S_OK;
 }
 
 void TpmPcp::Close()
 {
-    if (_hProvider) { NCryptFreeObject(_hProvider); _hProvider = 0; }
-    _isOpen = false;
+    _provider.Reset();
 }
 
-std::vector<uint8_t> TpmPcp::ReadEkCertificate()
+_Use_decl_annotations_
+HRESULT TpmPcp::ReadProperty(PCWSTR property, std::vector<uint8_t>* out_value)
 {
-    if (!_isOpen) return {};
+    out_value->clear();
+    if (!_provider) return RH_E_NOT_OPEN;
 
-    DWORD cbResult = 0;
-    SECURITY_STATUS status = NCryptGetProperty(
-        _hProvider, L"PCP_RSA_EKNVCERT", nullptr, 0, &cbResult, 0);
+    DWORD size = 0;
+    SECURITY_STATUS status =
+        NCryptGetProperty(_provider.Get(), property, nullptr, 0, &size, 0);
+    if (FAILED(status)) {
+        RH_LOG_WARN("[pcp] NCryptGetProperty(%S) size query failed: 0x%08X\n", property, (unsigned)status);
+        return HrFromSecurityStatus(status);
+    }
+    if (size == 0) return RH_E_MALFORMED_RESPONSE;
 
-    if (FAILED(status) || cbResult == 0) return {};
+    std::vector<uint8_t> value(size);
+    status = NCryptGetProperty(_provider.Get(), property, value.data(), size, &size, 0);
+    if (FAILED(status)) {
+        RH_LOG_WARN("[pcp] NCryptGetProperty(%S) failed: 0x%08X\n", property, (unsigned)status);
+        return HrFromSecurityStatus(status);
+    }
 
-    std::vector<uint8_t> cert(cbResult);
-    status = NCryptGetProperty(
-        _hProvider, L"PCP_RSA_EKNVCERT", cert.data(), cbResult, &cbResult, 0);
-
-    if (FAILED(status)) return {};
-    cert.resize(cbResult);
-    return cert;
+    value.resize(size);
+    *out_value = std::move(value);
+    return S_OK;
 }
 
-std::vector<uint8_t> TpmPcp::ReadEkPublicKey()
+_Use_decl_annotations_
+HRESULT TpmPcp::ReadEkCertificate(std::vector<uint8_t>* out_certificate)
 {
-    if (!_isOpen) return {};
+    return ReadProperty(L"PCP_RSA_EKNVCERT", out_certificate);
+}
 
-    DWORD cbResult = 0;
-    SECURITY_STATUS status = NCryptGetProperty(
-        _hProvider, L"PCP_EKPUB", nullptr, 0, &cbResult, 0);
-
-    if (FAILED(status) || cbResult == 0) return {};
-
-    std::vector<uint8_t> pubKey(cbResult);
-    status = NCryptGetProperty(
-        _hProvider, L"PCP_EKPUB", pubKey.data(), cbResult, &cbResult, 0);
-
-    if (FAILED(status)) return {};
-    pubKey.resize(cbResult);
-    return pubKey;
+_Use_decl_annotations_
+HRESULT TpmPcp::ReadEkPublicKey(std::vector<uint8_t>* out_publicKey)
+{
+    return ReadProperty(L"PCP_EKPUB", out_publicKey);
 }
 
 } // namespace RootHerald

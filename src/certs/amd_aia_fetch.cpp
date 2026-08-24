@@ -1,20 +1,16 @@
-/**
- * AMD fTPM EK certificate fetch — implementation.
- *
- * Hashes the EK RSA modulus with SHA-256 (via BCrypt), hex-encodes the
- * digest lowercase, and HTTP-GETs https://ftpm.amd.com/pki/aia/<hex>.
- */
-
 #include "amd_aia_fetch.h"
-#include "http_winhttp.h"
-#include "log.h"
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <intsafe.h>
+#include <sal.h>
 
-#include <cstdio>
 #include <cstring>
 #include <string>
+
+#include "http_winhttp.h"
+#include "log.h"
+#include "unique_handle.h"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -22,17 +18,13 @@ namespace RootHerald {
 
 namespace {
 
-// BCRYPT_RSAKEY_BLOB layout (see ncrypt.h / bcrypt.h):
-//   ULONG Magic;        // 'RSA1' = 0x31415352 for public
-//   ULONG BitLength;
-//   ULONG cbPublicExp;
-//   ULONG cbModulus;
-//   ULONG cbPrime1;     // zero for public blobs
-//   ULONG cbPrime2;     // zero for public blobs
-// Followed by: PublicExponent[cbPublicExp], Modulus[cbModulus].
-constexpr uint32_t kBcryptRsaPublicMagic = 0x31415352u; // 'RSA1'
+/* BCRYPT_RSAKEY_BLOB: Magic, BitLength, cbPublicExp, cbModulus, cbPrime1,
+ * cbPrime2 (all ULONG), then PublicExponent[cbPublicExp], Modulus[cbModulus].
+ * The cb* names mirror the Win32 field names deliberately. */
+constexpr uint32_t BCRYPT_RSA_PUBLIC_MAGIC = 0x31415352u; // 'RSA1'
+constexpr uint32_t MAX_MODULUS_BYTES = 1024;
 
-uint32_t ReadU32Le(const uint8_t* p)
+uint32_t ReadU32Le(_In_reads_bytes_(4) const uint8_t* p)
 {
     return  (uint32_t)p[0]
          | ((uint32_t)p[1] << 8)
@@ -40,36 +32,29 @@ uint32_t ReadU32Le(const uint8_t* p)
          | ((uint32_t)p[3] << 24);
 }
 
-bool Sha256(const uint8_t* data, size_t len, uint8_t out[32])
+_Success_(return)
+bool Sha256(_In_reads_bytes_(len) const uint8_t* data, size_t len, _Out_writes_bytes_all_(32) uint8_t* out)
 {
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    NTSTATUS s = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (s != 0) return false;
-
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-    s = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
-    if (s != 0) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+    UniqueBcryptAlg algorithm;
+    if (BCryptOpenAlgorithmProvider(algorithm.Put(), BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
         return false;
-    }
 
-    bool ok = true;
-    if (BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0) != 0) ok = false;
-    if (ok && BCryptFinishHash(hHash, out, 32, 0) != 0) ok = false;
+    UniqueBcryptHash hash;
+    if (BCryptCreateHash(algorithm.Get(), hash.Put(), nullptr, 0, nullptr, 0, 0) != 0)
+        return false;
 
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return ok;
+    if (BCryptHashData(hash.Get(), (PUCHAR)data, (ULONG)len, 0) != 0) return false;
+    return BCryptFinishHash(hash.Get(), out, 32, 0) == 0;
 }
 
-std::string HexLower(const uint8_t* data, size_t len)
+std::string HexLower(_In_reads_bytes_(len) const uint8_t* data, size_t len)
 {
-    static const char hex[] = "0123456789abcdef";
+    static const char HEX[] = "0123456789abcdef";
     std::string s;
     s.reserve(len * 2);
     for (size_t i = 0; i < len; ++i) {
-        s += hex[data[i] >> 4];
-        s += hex[data[i] & 0x0F];
+        s += HEX[data[i] >> 4];
+        s += HEX[data[i] & 0x0F];
     }
     return s;
 }
@@ -78,23 +63,27 @@ std::string HexLower(const uint8_t* data, size_t len)
 
 std::vector<uint8_t> ExtractRsaModulusFromEkPub(const std::vector<uint8_t>& ekPubBlob)
 {
-    // The NCrypt PCP_EKPUB property returns a BCRYPT_RSAKEY_BLOB. Validate
-    // and slice out the modulus. We tolerate larger blobs (trailing data).
+    // A larger blob with trailing data is tolerated.
     if (ekPubBlob.size() < 24) return {};
+
     uint32_t magic       = ReadU32Le(ekPubBlob.data() + 0);
-    /* uint32_t bitLength */
     uint32_t cbPublicExp = ReadU32Le(ekPubBlob.data() + 8);
     uint32_t cbModulus   = ReadU32Le(ekPubBlob.data() + 12);
 
-    if (magic != kBcryptRsaPublicMagic) return {};
-    if (cbModulus == 0 || cbModulus > 1024) return {};
+    if (magic != BCRYPT_RSA_PUBLIC_MAGIC) return {};
+    if (cbModulus == 0 || cbModulus > MAX_MODULUS_BYTES) return {};
 
-    size_t modOffset = 24 + cbPublicExp;
-    if (modOffset + cbModulus > ekPubBlob.size()) return {};
+    // Both lengths come straight off the wire, so the offsets are computed
+    // with checked arithmetic rather than trusted to wrap benignly.
+    size_t modulusOffset = 0;
+    size_t modulusEnd = 0;
+    if (FAILED(SizeTAdd(24, cbPublicExp, &modulusOffset))) return {};
+    if (FAILED(SizeTAdd(modulusOffset, cbModulus, &modulusEnd))) return {};
+    if (modulusEnd > ekPubBlob.size()) return {};
 
     return std::vector<uint8_t>(
-        ekPubBlob.data() + modOffset,
-        ekPubBlob.data() + modOffset + cbModulus);
+        ekPubBlob.data() + modulusOffset,
+        ekPubBlob.data() + modulusEnd);
 }
 
 std::vector<uint8_t> FetchAmdAiaEkCert(const std::vector<uint8_t>& ekPubModulus)
@@ -107,18 +96,17 @@ std::vector<uint8_t> FetchAmdAiaEkCert(const std::vector<uint8_t>& ekPubModulus)
         return {};
     }
 
-    std::string hex = HexLower(digest, sizeof(digest));
-    std::string url = "https://ftpm.amd.com/pki/aia/" + hex;
+    std::string url = "https://ftpm.amd.com/pki/aia/" + HexLower(digest, sizeof(digest));
 
     RH_LOG_WARN("[amd-aia] GET %s\n", url.c_str());
-    HttpResponse resp = HttpGet(url);
-    if (resp.statusCode != 200) {
+    HttpResponse response = HttpGet(url);
+    if (response.statusCode != 200) {
         RH_LOG_WARN("[amd-aia] HTTP %d (body=%zu bytes)\n",
-                resp.statusCode, resp.body.size());
+                    response.statusCode, response.body.size());
         return {};
     }
 
-    return std::vector<uint8_t>(resp.body.begin(), resp.body.end());
+    return std::vector<uint8_t>(response.body.begin(), response.body.end());
 }
 
 } // namespace RootHerald
