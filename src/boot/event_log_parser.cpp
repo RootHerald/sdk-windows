@@ -9,6 +9,7 @@
  */
 
 #include "event_log_parser.h"
+#include "efi_variable.h"
 
 #include <sal.h>
 #include <cstring>
@@ -64,21 +65,9 @@ const char* EventTypeName(uint32_t eventType) {
  * UnicodeName VariableData. The name is UCS-2LE; anything non-ASCII becomes
  * a question mark, and the walk stops at 256 characters. */
 static std::string ExtractEfiVariableName(const std::vector<uint8_t>& data) {
-    if (data.size() < 32) return "";
-
-    uint64_t nameLen = 0;
-    memcpy(&nameLen, data.data() + 16, 8); // UnicodeNameLength is in chars
-
-    if (32 + nameLen * 2 > data.size()) return "";
-
-    std::string name;
-    for (uint64_t i = 0; i < nameLen && i < 256; i++) {
-        uint16_t ch = ReadU16LE(data.data() + 32 + i * 2);
-        if (ch == 0) break;
-        if (ch < 128) name += (char)ch;
-        else name += '?';
-    }
-    return name;
+    EfiVariableData var;
+    if (!TryParseEfiVariableData(data, &var)) return "";
+    return EfiVariableName(var);
 }
 
 /* UEFI_IMAGE_LOAD_EVENT: ImageLocationInMemory(8) ImageLengthInMemory(8)
@@ -123,15 +112,11 @@ static bool IsSecureBootEnabled(const std::string& varName, const std::vector<ui
     if (varName != "SecureBoot") return false;
     if (data.size() < 33) return false;
 
-    uint64_t nameLen = 0, dataLen = 0;
-    memcpy(&nameLen, data.data() + 16, 8);
-    memcpy(&dataLen, data.data() + 24, 8);
+    EfiVariableData var;
+    if (!TryParseEfiVariableData(data, &var) || var.dataBytes < 1)
+        return false;
 
-    size_t dataOffset = 32 + nameLen * 2;
-    if (dataOffset < data.size() && dataLen >= 1) {
-        return data[dataOffset] == 1;
-    }
-    return false;
+    return var.data[0] == 1;
 }
 
 EventLogAnalysis ParseAndAnalyzeEventLog(const std::vector<uint8_t>& rawLog) {
