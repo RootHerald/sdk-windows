@@ -51,6 +51,7 @@
 #  define _Out_
 #  define _Outptr_result_z_
 #  define _Ret_maybenull_
+#  define _Success_(expr)
 #endif
 
 #ifdef __cplusplus
@@ -106,6 +107,7 @@ ROOTHERALD_API void RootHeraldClient_Destroy(_In_opt_ RootHeraldClient* client);
 
 /* Logical application id (e.g. "launcher") surfaced in audit logs and
  * per-application policy. */
+_Success_(return == ROOTHERALD_OK)
 ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetApplicationId(
     _In_ RootHeraldClient* client,
     _In_z_ const char* app_id);
@@ -135,6 +137,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_SetApplicationId(
 
 /* out_request_json: caller owns; free with RootHeraldClient_FreeEvidence.
  * NULL on error. */
+_Success_(return == ROOTHERALD_OK)
 ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollBegin(
     _In_ RootHeraldClient* client,
     _Outptr_result_z_ char** out_request_json);
@@ -142,6 +145,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollBegin(
 /* challenge_json: the verbatim /enroll response the backend relayed back.
  * out_activation_json: caller owns; free with RootHeraldClient_FreeEvidence.
  * Returns ROOTHERALD_ERR_NOT_ENROLLED if no in-flight EnrollBegin state exists. */
+_Success_(return == ROOTHERALD_OK)
 ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollComplete(
     _In_ RootHeraldClient* client,
     _In_z_ const char* challenge_json,
@@ -151,6 +155,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_EnrollComplete(
 /* Local state — never touches the network                             */
 /* ------------------------------------------------------------------ */
 
+_Success_(return == ROOTHERALD_OK)
 ROOTHERALD_API RootHeraldStatus RootHeraldClient_GetDeviceInfo(
     _In_ RootHeraldClient* client,
     _Out_ RootHeraldDeviceInfo* out_result);
@@ -166,6 +171,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_GetDeviceInfo(
  *
  * Tri-state ints use -1 for undetermined; counts use -1 for unavailable.
  */
+_Success_(return == ROOTHERALD_OK)
 ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
     _In_ RootHeraldClient* client,
     _Out_ RootHeraldPosture* out_result);
@@ -194,6 +200,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
  * The quote is taken OVER it, so freshness is bound inside the signature.
  * out_evidence_json: exactly the object /attestations/verify expects in its
  * `evidence` field. Caller owns; free with RootHeraldClient_FreeEvidence. */
+_Success_(return == ROOTHERALD_OK)
 ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectEvidence(
     _In_z_ const char* nonce_b64,
     _Outptr_result_z_ char** out_evidence_json);
