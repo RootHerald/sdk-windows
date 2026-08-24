@@ -49,15 +49,20 @@ ROOTHERALD_API RootHeraldResult RootHeraldGetStatus(_Out_ RootHeraldDeviceStatus
  * and CollectEvidence then derives the id from the EK. */
 ROOTHERALD_API void RootHeraldSetDeviceId(_In_opt_z_ const char* device_id);
 
-/* out_*_json buffers are caller-owned: free with RootHeraldFreeEvidence. */
+/* out_*_json buffers are caller-owned: free with RootHeraldFreeEvidence. Each is
+ * set on success and left null otherwise, which is what lets the public wrappers
+ * carry the stronger _Outptr_result_z_ contract. */
+_Success_(return == RH_PROTO_OK)
 ROOTHERALD_API RootHeraldResult RootHeraldEnrollBegin(
-    _Outptr_result_maybenull_z_ char** out_enroll_json);
+    _Outptr_result_z_ char** out_enroll_json);
+_Success_(return == RH_PROTO_OK)
 ROOTHERALD_API RootHeraldResult RootHeraldEnrollComplete(
     _In_z_ const char* challenge_json,
-    _Outptr_result_maybenull_z_ char** out_activate_json);
+    _Outptr_result_z_ char** out_activate_json);
+_Success_(return == RH_PROTO_OK)
 ROOTHERALD_API RootHeraldResult RootHeraldCollectEvidence(
     _In_z_ const char* nonce_b64,
-    _Outptr_result_maybenull_z_ char** out_evidence_json);
+    _Outptr_result_z_ char** out_evidence_json);
 ROOTHERALD_API RootHeraldResult RootHeraldCollectLocalPosture(_Out_ RootHeraldPosture* out_posture);
 ROOTHERALD_API void RootHeraldFreeEvidence(_In_opt_ char* evidence_json);
 
