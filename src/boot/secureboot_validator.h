@@ -41,7 +41,7 @@ struct SecureBootChainReport {
     bool dbHasMicrosoftUefiCa2023 = false;
     bool dbHasWindowsPca2011 = false;
 
-    int dbxHashCount = 0;               // forbidden signatures
+    int dbxHashCount = 0;               // dbx EFI_CERT_SHA256_GUID entries
 
     bool chainValid = false;
     std::string verdict;
@@ -51,8 +51,11 @@ struct SecureBootChainReport {
 
 /* variableData is the raw event data of a PCR[7] EV_EFI_VARIABLE_DRIVER_CONFIG
  * entry: EFI_GUID(16) UnicodeNameLength(8) VariableDataLength(8) UnicodeName
- * VariableData. Non-X.509 signature lists yield no certificates. */
-std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData);
+ * VariableData. Only EFI_CERT_X509_GUID lists yield certificates; out_sha256Count
+ * receives the number of EFI_CERT_SHA256_GUID entries, which is the whole of a
+ * dbx and none of a db. */
+std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData,
+                                            int* out_sha256Count);
 
 SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEventLog);
 
