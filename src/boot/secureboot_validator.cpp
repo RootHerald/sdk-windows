@@ -8,6 +8,7 @@
  */
 
 #include "secureboot_validator.h"
+#include "efi_variable.h"
 #include "event_log_parser.h"
 
 #include <windows.h>
@@ -39,30 +40,33 @@ static const char* MS_UEFI_CA_2023_THUMBPRINT =
     "45A0FA32604773C82433C3B7D59E7466B3AC0C7CEEE2B40EA4EE0E14A0925F28";
 
 /* Substrings matched against a Platform Key's subject or issuer. */
-static const char* KNOWN_OEM_NAMES[] = {
-    "Lenovo", "LENOVO",
-    "Dell", "DELL",
-    "HP", "Hewlett-Packard", "Hewlett Packard",
-    "ASUS", "ASUSTeK",
-    "Acer",
-    "Microsoft", // Surface devices
-    "Samsung",
-    "Toshiba",
-    "Fujitsu",
-    "Intel",
-    "AMI", "American Megatrends",
-    "Phoenix",
-    "Insyde",
-    "ASRock",
-    "Gigabyte",
-    "MSI", "Micro-Star",
-    "Razer",
-    "Framework",
-    "System76",
-    "HUAWEI",
-    "Xiaomi",
+/* Platform owners. A PK issued to one of these names is the machine's owner
+ * asserting control of Secure Boot, which is what oem_keyed reports. */
+static const char* PLATFORM_OWNER_NAMES[] = {
+    "Lenovo", "Dell", "Hewlett-Packard", "Hewlett Packard", "HP Inc",
+    "ASUSTeK", "ASUS", "Acer", "Microsoft", "Samsung", "Toshiba", "Fujitsu",
+    "ASRock", "Gigabyte", "MSI", "Micro-Star", "Supermicro", "Panasonic",
+    "Sony", "LG Electronics", "Razer", "Framework", "System76",
     nullptr
 };
+
+/* Firmware vendors. Their names appear in the PK of many machines whose owner
+ * never replaced the default key, so a match here is NOT evidence that a
+ * platform owner keyed the machine and must not set oem_keyed. */
+static const char* FIRMWARE_VENDOR_NAMES[] = {
+    "American Megatrends", "AMI", "Phoenix", "Insyde", "Intel", "Byosoft",
+    nullptr
+};
+
+/* Default and test Platform Keys that ship enabled on real hardware. Matching
+ * one is the opposite of an owner-keyed machine, so it overrides everything
+ * else. "DO NOT TRUST" is AMI's own wording on the test PK it ships. */
+static const char* UNTRUSTED_PK_MARKERS[] = {
+    "DO NOT TRUST", "DO_NOT_TRUST", "Test PK", "TestPK", "Insyde Test",
+    "Default PK", "Sample", "Do Not Ship",
+    nullptr
+};
+
 
 static uint16_t ReadU16LE(_In_reads_bytes_(2) const uint8_t* p) { return p[0] | (p[1] << 8); }
 static uint32_t ReadU32LE(_In_reads_bytes_(4) const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
@@ -101,6 +105,24 @@ static std::string CertThumbprint(_In_reads_bytes_(derLen) const uint8_t* derDat
     return BytesToHexUpper(digest, 32);
 }
 
+static bool ContainsNoCase(const std::string& haystack, const std::string& needle) {
+    if (needle.empty() || haystack.size() < needle.size()) return false;
+    return std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                       [](char a, char b) {
+                           return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+                       }) != haystack.end();
+}
+
+/* One RDN value from the subject, e.g. szOID_ORGANIZATION_NAME. Returns "" when
+ * the attribute is absent, which is why every caller treats absence as no match
+ * rather than as a wildcard. */
+static std::string RdnValue(_In_ PCCERT_CONTEXT ctx, _In_z_ LPCSTR oid) {
+    char value[256] = {};
+    const DWORD n = CertGetNameStringA(ctx, CERT_NAME_ATTR_TYPE, 0, (void*)oid,
+                                       value, sizeof(value));
+    return (n > 1) ? std::string(value) : std::string();
+}
+
 static CertInfo ParseDerCertificate(_In_reads_bytes_(derLen) const uint8_t* derData, size_t derLen) {
     CertInfo info;
 
@@ -128,16 +150,43 @@ static CertInfo ParseDerCertificate(_In_reads_bytes_(derLen) const uint8_t* derD
         thumbUpper == MS_KEK_CA_2011_THUMBPRINT ||
         thumbUpper == MS_UEFI_CA_2023_THUMBPRINT) {
         info.isMicrosoftCert = true;
-    }
-    if (info.subject.find("Microsoft") != std::string::npos) {
+    } else if (ContainsNoCase(RdnValue(ctx.Get(), szOID_ORGANIZATION_NAME),
+                              "Microsoft Corporation")) {
+        /* A pinned thumbprint is the real signal; this catches a rotated
+         * Microsoft CA. Scoped to the organization RDN, because matching
+         * "Microsoft" anywhere in a DN also matches an issuer field, a test
+         * key, and anyone who puts the word in a common name. */
         info.isMicrosoftCert = true;
     }
 
-    for (int i = 0; KNOWN_OEM_NAMES[i]; i++) {
-        if (info.subject.find(KNOWN_OEM_NAMES[i]) != std::string::npos ||
-            info.issuer.find(KNOWN_OEM_NAMES[i]) != std::string::npos) {
+    /* Order matters. A default or test PK often carries a firmware vendor's
+     * name, and the AMI test key's subject is literally
+     * "CN=DO NOT TRUST - AMI Test PK" — matching "AMI" there and reporting an
+     * owner-keyed machine inverts the meaning of the field. */
+    const std::string org = RdnValue(ctx.Get(), szOID_ORGANIZATION_NAME);
+    const std::string cn  = RdnValue(ctx.Get(), szOID_COMMON_NAME);
+
+    for (int i = 0; UNTRUSTED_PK_MARKERS[i]; i++) {
+        if (ContainsNoCase(cn, UNTRUSTED_PK_MARKERS[i]) ||
+            ContainsNoCase(org, UNTRUSTED_PK_MARKERS[i])) {
+            info.oemName = "untrusted-default-key";
+            return info;
+        }
+    }
+
+    for (int i = 0; FIRMWARE_VENDOR_NAMES[i]; i++) {
+        if (ContainsNoCase(org, FIRMWARE_VENDOR_NAMES[i])) {
+            info.oemName = "firmware-vendor";
+            return info;
+        }
+    }
+
+    /* Matched against the organization RDN, not the whole distinguished name:
+     * the O= field names the entity the certificate was issued to. */
+    for (int i = 0; PLATFORM_OWNER_NAMES[i]; i++) {
+        if (ContainsNoCase(org, PLATFORM_OWNER_NAMES[i])) {
             info.isKnownOem = true;
-            info.oemName = KNOWN_OEM_NAMES[i];
+            info.oemName = PLATFORM_OWNER_NAMES[i];
             break;
         }
     }
@@ -148,17 +197,11 @@ static CertInfo ParseDerCertificate(_In_reads_bytes_(derLen) const uint8_t* derD
 std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variableData) {
     std::vector<CertInfo> certs;
 
-    if (variableData.size() < 32) return certs;
+    EfiVariableData var;
+    if (!TryParseEfiVariableData(variableData, &var)) return certs;
 
-    uint64_t nameLen = 0, dataLen = 0;
-    memcpy(&nameLen, variableData.data() + 16, 8);
-    memcpy(&dataLen, variableData.data() + 24, 8);
-
-    size_t dataOffset = 32 + (size_t)(nameLen * 2);
-    if (dataOffset + dataLen > variableData.size()) return certs;
-
-    const uint8_t* sigListData = variableData.data() + dataOffset;
-    size_t sigListRemaining = (size_t)dataLen;
+    const uint8_t* sigListData = var.data;
+    size_t sigListRemaining = var.dataBytes;
 
     while (sigListRemaining >= 28) { // GUID(16) + 3 * uint32
         const uint8_t* sigType = sigListData;
@@ -198,18 +241,9 @@ std::vector<CertInfo> ParseEfiSignatureList(const std::vector<uint8_t>& variable
 }
 
 static std::string ExtractVarName(const std::vector<uint8_t>& data) {
-    if (data.size() < 32) return "";
-    uint64_t nameLen = 0;
-    memcpy(&nameLen, data.data() + 16, 8);
-    if (32 + nameLen * 2 > data.size()) return "";
-
-    std::string name;
-    for (uint64_t i = 0; i < nameLen && i < 256; i++) {
-        uint16_t ch = ReadU16LE(data.data() + 32 + i * 2);
-        if (ch == 0) break;
-        if (ch < 128) name += (char)ch;
-    }
-    return name;
+    EfiVariableData var;
+    if (!TryParseEfiVariableData(data, &var)) return "";
+    return EfiVariableName(var);
 }
 
 SecureBootChainReport ValidateSecureBootChain(const std::vector<uint8_t>& rawEventLog) {
