@@ -16,3 +16,37 @@ jobs:
 
       - run: cmake -B build -S . -A x64
       - run: cmake --build build --config Release
+
+  # MSVC's static analyser, checked against the SAL annotations on the public ABI.
+  #
+  # Those annotations describe the contract a consumer links against — which
+  # pointers may be null, which are written, which return a NUL-terminated string
+  # the caller then owns. Nothing verifies them by being present, so left
+  # unchecked they decay into comments that happen to compile, and a wrong one is
+  # worse than none: it tells a caller a buffer is safe to read when it is not.
+  #
+  # Enforcing rather than reporting. The tree is at zero analyser warnings, so
+  # there is no backlog to grandfather in, and a report-only gate on already-clean
+  # code is one that gets ignored the first time it fires.
+  analyze:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Passed through the environment, not -DCMAKE_CXX_FLAGS. That variable
+      # REPLACES the flags CMake selects for the toolchain rather than adding to
+      # them, which drops /EHsc and makes every use of the standard library warn
+      # about unwind semantics — a wall of C4530 that says nothing about this
+      # code. The environment form is appended, so the defaults survive.
+      #
+      # /WX, not /analyze:WX. The latter is accepted and does not promote analyser
+      # warnings to errors: the build still exits 0 with a C6386 buffer overrun on
+      # screen. Verified by planting one.
+      - name: Configure with the static analyser
+        env:
+          CFLAGS: /analyze /WX
+          CXXFLAGS: /analyze /WX
+        run: cmake -B build-analyze -S . -A x64
+
+      - name: Build
+        run: cmake --build build-analyze --config Release
