@@ -1,6 +1,5 @@
 #include "tbs_key_provider.h"
 
-#include "log.h"
 #include "win_status.h"
 
 namespace RootHerald {
@@ -15,14 +14,15 @@ HRESULT TbsKeyProvider::Open() { return _tpm.Open(); }
 
 void TbsKeyProvider::FlushTransients()
 {
+    /* Best-effort on both. A failed flush leaks a transient handle until the
+     * TPM context is torn down, and there is nothing a caller could do about
+     * it — which is why the only handling this ever had was a debug log. */
     if (_akHandle) {
-        HRESULT hr = _tpm.FlushContext(_akHandle);
-        if (FAILED(hr)) RH_LOG_DEBUG("[tbs] FlushContext(AK): 0x%08X\n", (unsigned)hr);
+        (void)_tpm.FlushContext(_akHandle);
         _akHandle = 0;
     }
     if (_ekHandle) {
-        HRESULT hr = _tpm.FlushContext(_ekHandle);
-        if (FAILED(hr)) RH_LOG_DEBUG("[tbs] FlushContext(EK): 0x%08X\n", (unsigned)hr);
+        (void)_tpm.FlushContext(_ekHandle);
         _ekHandle = 0;
     }
 }
@@ -47,13 +47,11 @@ HRESULT TbsKeyProvider::CreateAk()
     // matches PCP_EKPUB, so a seed the server sealed to PCP_EKPUB opens here.
     HRESULT hr = _tpm.CreateEk(&_ekHandle);
     if (FAILED(hr) || !_ekHandle) {
-        RH_LOG_WARN("[tbs] CreateEk failed: 0x%08X\n", (unsigned)hr);
         return FAILED(hr) ? hr : E_FAIL;
     }
 
     hr = _tpm.CreateAndLoadAk(TPM_RH_OWNER, &_akHandle, &_akPublicArea);
     if (FAILED(hr) || !_akHandle || _akPublicArea.empty()) {
-        RH_LOG_WARN("[tbs] CreateAndLoadAk failed: 0x%08X\n", (unsigned)hr);
         FlushTransients();
         return FAILED(hr) ? hr : E_FAIL;
     }
@@ -83,7 +81,6 @@ HRESULT TbsKeyProvider::ActivateCredential(const std::vector<uint8_t>& credentia
 {
     out_secret->clear();
     if (!_akHandle || !_ekHandle) {
-        RH_LOG_WARN("[tbs] ActivateCredential called before CreateAk\n");
         return RH_E_NOT_OPEN;
     }
     return _tpm.ActivateCredential(_akHandle, _ekHandle, credentialBlob, encryptedSecret, out_secret);
@@ -95,8 +92,6 @@ HRESULT TbsKeyProvider::PersistAk()
 
     HRESULT hr = _tpm.EvictControl(_akHandle, _persistentHandle);
     if (FAILED(hr)) {
-        RH_LOG_WARN("[tbs] EvictControl(AK -> 0x%08X) failed: 0x%08X\n",
-                    _persistentHandle, (unsigned)hr);
         return hr;
     }
 

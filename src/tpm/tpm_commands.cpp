@@ -8,7 +8,6 @@
 
 #include <cstring>
 
-#include "log.h"
 #include "win_status.h"
 
 #pragma comment(lib, "tbs.lib")
@@ -175,7 +174,6 @@ HRESULT TpmCommands::Open()
 
     TBS_RESULT result = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, _context.Put());
     if (result != TBS_SUCCESS) {
-        RH_LOG_WARN("[tbs] Tbsi_Context_Create failed: 0x%08X\n", (unsigned)result);
         return HrFromTbs(result);
     }
     return S_OK;
@@ -212,7 +210,6 @@ HRESULT TpmCommands::SendCommand(std::vector<uint8_t>* command,
         response.data(), &responseLen);
 
     if (result != TBS_SUCCESS) {
-        RH_LOG_WARN("[tbs] Tbsip_Submit_Command failed: 0x%08X\n", (unsigned)result);
         return HrFromTbs(result);
     }
 
@@ -244,7 +241,6 @@ HRESULT TpmCommands::PcrRead(uint32_t pcrIndex, std::vector<uint8_t>* out_digest
 
     uint32_t rc = ReadU32(resp.data() + 6);
     if (rc != TPM2_RC_SUCCESS) {
-        RH_LOG_DEBUG("[tbs] PCR_Read(%u): 0x%08X\n", pcrIndex, rc);
         return HrFromTpmRc(rc);
     }
 
@@ -316,7 +312,6 @@ HRESULT TpmCommands::Quote(uint32_t akHandle,
 
     uint32_t rc = ReadU32(resp.data() + 6);
     if (rc != TPM2_RC_SUCCESS) {
-        RH_LOG_WARN("[tbs] Quote: 0x%08X\n", rc);
         return HrFromTpmRc(rc);
     }
 
@@ -383,7 +378,6 @@ HRESULT TpmCommands::CreateAndLoadAk(uint32_t parentHandle,
 
     uint32_t rc = ReadU32(resp.data() + 6);
     if (rc != TPM2_RC_SUCCESS) {
-        RH_LOG_WARN("[tbs] CreatePrimary(AK): 0x%08X\n", rc);
         return HrFromTpmRc(rc);
     }
 
@@ -431,7 +425,6 @@ HRESULT TpmCommands::CreateEk(uint32_t* out_handle)
 
     uint32_t rc = ReadU32(resp.data() + 6);
     if (rc != TPM2_RC_SUCCESS) {
-        RH_LOG_WARN("[tbs] CreatePrimary(EK): 0x%08X\n", rc);
         return HrFromTpmRc(rc);
     }
 
@@ -473,7 +466,6 @@ HRESULT TpmCommands::ActivateCredential(uint32_t akHandle,
 
             uint32_t rc = ReadU32(startResp.data() + 6);
             if (rc != TPM2_RC_SUCCESS) {
-                RH_LOG_WARN("[tbs] StartAuthSession: 0x%08X\n", rc);
                 return HrFromTpmRc(rc);
             }
 
@@ -501,12 +493,10 @@ HRESULT TpmCommands::ActivateCredential(uint32_t akHandle,
             HRESULT hr = SendCommand(&policyCmd, &policyResp);
             if (FAILED(hr)) return hr;
             if (policyResp.size() < 10) {
-                RH_LOG_WARN("[tbs] PolicySecret: response too short\n");
                 return RH_E_MALFORMED_RESPONSE;
             }
             uint32_t rc = ReadU32(policyResp.data() + 6);
             if (rc != TPM2_RC_SUCCESS) {
-                RH_LOG_WARN("[tbs] PolicySecret: 0x%08X\n", rc);
                 return HrFromTpmRc(rc);
             }
         }
@@ -546,7 +536,6 @@ HRESULT TpmCommands::ActivateCredential(uint32_t akHandle,
             if (rc != TPM2_RC_SUCCESS) {
                 // TBS surfaces Windows HRESULTs here too; 0x80280400
                 // (TPM_E_COMMAND_BLOCKED) means a non-elevated caller.
-                RH_LOG_WARN("[tbs] ActivateCredential: 0x%08X\n", rc);
                 return HrFromTpmRc(rc);
             }
 
@@ -576,7 +565,6 @@ bool TpmCommands::IsPersistentPresent(uint32_t persistentHandle)
     std::vector<uint8_t> resp;
     HRESULT hr = SendCommand(&cmd, &resp);
     if (FAILED(hr)) {
-        RH_LOG_DEBUG("[tbs] ReadPublic(0x%08X): 0x%08X\n", persistentHandle, (unsigned)hr);
         return false;
     }
     if (resp.size() < 10) return false;
@@ -599,12 +587,10 @@ HRESULT TpmCommands::EvictControl(uint32_t transientHandle, uint32_t persistentH
         HRESULT hr = SendCommand(&clearCmd, &clearResp);
         if (FAILED(hr)) return hr;
         if (clearResp.size() < 10) {
-            RH_LOG_WARN("[tbs] EvictControl clear: response too short\n");
             return RH_E_MALFORMED_RESPONSE;
         }
         uint32_t clearRc = ReadU32(clearResp.data() + 6);
         if (clearRc != TPM2_RC_SUCCESS) {
-            RH_LOG_WARN("[tbs] EvictControl clear: 0x%08X\n", clearRc);
             return HrFromTpmRc(clearRc);
         }
     }
@@ -620,12 +606,10 @@ HRESULT TpmCommands::EvictControl(uint32_t transientHandle, uint32_t persistentH
     HRESULT hr = SendCommand(&cmd, &resp);
     if (FAILED(hr)) return hr;
     if (resp.size() < 10) {
-        RH_LOG_WARN("[tbs] EvictControl: response too short\n");
         return RH_E_MALFORMED_RESPONSE;
     }
     uint32_t rc = ReadU32(resp.data() + 6);
     if (rc != TPM2_RC_SUCCESS) {
-        RH_LOG_WARN("[tbs] EvictControl: 0x%08X\n", rc);
         return HrFromTpmRc(rc);
     }
     return S_OK;
