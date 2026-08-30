@@ -22,7 +22,6 @@
 #include "json_helpers.h"
 #include "unique_handle.h"
 #include "win_cert_store_intermediates.h"
-#include "log.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -42,9 +41,6 @@
 /* Owner-persistent NV slot for the AK. Chosen away from the canonical
  * 0x81010001 so vendor tooling cannot collide with it. */
 static const uint32_t TBS_AK_PERSISTENT_HANDLE = 0x81029301u;
-
-/* Caller-supplied device id override. Empty means derive it from the EK. */
-static std::string g_deviceId;
 
 static std::string Base64Encode(_In_reads_bytes_(len) const uint8_t* data, size_t len)
 {
@@ -266,16 +262,13 @@ static bool GatherEkEnrollData(_Inout_ EkEnrollData* out)
     RootHerald::TpmPcp pcp;
     HRESULT hr = pcp.Open();
     if (FAILED(hr)) {
-        RH_LOG_WARN("[enroll] PCP open failed (EK extraction): 0x%08X\n", (unsigned)hr);
         return false;
     }
 
     hr = pcp.ReadEkPublicKey(&out->ekPub);
     if (FAILED(hr) || out->ekPub.empty()) {
-        RH_LOG_WARN("[enroll] EK pub read failed: 0x%08X\n", (unsigned)hr);
         return false;
     }
-    RH_LOG_WARN("[enroll] EK pub: %zu bytes\n", out->ekPub.size());
 
     // Windows' cached cert first — it is the real vendor-signed one and works
     // for firmware TPMs. Then the PCP NV read, then AMD's AIA endpoint.
@@ -285,7 +278,6 @@ static bool GatherEkEnrollData(_Inout_ EkEnrollData* out)
         if (SUCCEEDED(pcp.ReadEkCertificate(&nvCert))) ekCert = std::move(nvCert);
     }
     if (ekCert.size() > 32) {
-        RH_LOG_WARN("[enroll] EK cert: %zu bytes\n", ekCert.size());
         out->ekCertPem = DerToPem(ekCert);
     } else {
         auto modulus = RootHerald::ExtractRsaModulusFromEkPub(out->ekPub);
@@ -322,7 +314,6 @@ static bool GatherEkEnrollData(_Inout_ EkEnrollData* out)
         }
         if (out->intermediates.size() > MAX_INTERMEDIATES) out->intermediates.resize(MAX_INTERMEDIATES);
     }
-    RH_LOG_WARN("[enroll] EK cert chain: %zu intermediate(s)\n", out->intermediates.size());
     return true;
 }
 
@@ -373,65 +364,57 @@ static bool IsAkPersisted()
  * round-trip. */
 static std::unique_ptr<RootHerald::TbsKeyProvider> g_enrollProvider;
 
-extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldResult RootHeraldEnrollBegin(
+extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldStatus RootHeraldEnrollBegin(
     char** out_enroll_json)
 {
-    if (!out_enroll_json) return RH_PROTO_ERR_INVALID_PARAM;
+    if (!out_enroll_json) return ROOTHERALD_ERR_INVALID_ARG;
     *out_enroll_json = nullptr;
 
     // AK creation here and TPM2_ActivateCredential in EnrollComplete are both
     // blocked for a non-elevated caller (TPM_E_COMMAND_BLOCKED). Report it
     // rather than elevate; the host also has to keep this process resident.
     if (!IsProcessElevated()) {
-        RH_LOG_WARN("[enroll-begin] not elevated; raw-TBS activation will be blocked\n");
-        return RH_PROTO_ERR_ELEVATION_REQUIRED;
+        return ROOTHERALD_ERR_ELEVATION_REQUIRED;
     }
 
     EkEnrollData ek;
     if (!GatherEkEnrollData(&ek)) {
-        RH_LOG_WARN("[enroll-begin] EK gather failed\n");
-        return RH_PROTO_ERR_ENROLLMENT_FAILED;
+        return ROOTHERALD_ERR_EK_READ_FAILED;
     }
 
     auto provider = std::make_unique<RootHerald::TbsKeyProvider>(TBS_AK_PERSISTENT_HANDLE);
     HRESULT hr = provider->Open();
     if (FAILED(hr)) {
-        RH_LOG_WARN("[enroll-begin] provider open failed: 0x%08X\n", (unsigned)hr);
-        return RH_PROTO_ERR_ENROLLMENT_FAILED;
+        return ROOTHERALD_ERR_TPM_UNAVAILABLE;
     }
     hr = provider->CreateAk();
     if (FAILED(hr)) {
-        RH_LOG_WARN("[enroll-begin] CreateAk failed: 0x%08X\n", (unsigned)hr);
-        return RH_PROTO_ERR_ENROLLMENT_FAILED;
+        return ROOTHERALD_ERR_AK_FAILED;
     }
     auto akPublicArea = provider->GetAkPublicArea();
     if (akPublicArea.empty()) {
-        RH_LOG_WARN("[enroll-begin] GetAkPublicArea failed\n");
         provider->DeleteAk();
-        return RH_PROTO_ERR_ENROLLMENT_FAILED;
+        return ROOTHERALD_ERR_AK_FAILED;
     }
-    RH_LOG_WARN("[enroll-begin] AK created, pub area %zu bytes\n", akPublicArea.size());
 
     std::string json = RootHerald::JsonBuild(BuildEnrollFields(ek, akPublicArea));
     char* buffer = (char*)malloc(json.size() + 1);
-    if (!buffer) { provider->DeleteAk(); return RH_PROTO_ERR_INTERNAL; }
+    if (!buffer) { provider->DeleteAk(); return ROOTHERALD_ERR_INTERNAL; }
     memcpy(buffer, json.c_str(), json.size() + 1);
     *out_enroll_json = buffer;
 
     g_enrollProvider = std::move(provider);
-    return RH_PROTO_OK;
+    return ROOTHERALD_OK;
 }
 
-extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldResult RootHeraldEnrollComplete(
+extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldStatus RootHeraldEnrollComplete(
     const char* challenge_json, char** out_activate_json)
 {
-    if (!challenge_json || !out_activate_json) return RH_PROTO_ERR_INVALID_PARAM;
+    if (!challenge_json || !out_activate_json) return ROOTHERALD_ERR_INVALID_ARG;
     *out_activate_json = nullptr;
 
     if (!g_enrollProvider) {
-        RH_LOG_WARN("[enroll-complete] no in-flight enrollment — call EnrollBegin "
-                    "first in THIS (resident, elevated) process\n");
-        return RH_PROTO_ERR_NOT_ENROLLED;
+        return ROOTHERALD_ERR_NOT_ENROLLED;
     }
 
     std::string challenge(challenge_json);
@@ -439,29 +422,25 @@ extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldResult RootHeraldEnro
     auto credBlob  = RootHerald::JsonGet(challenge, "credentialBlob");
     auto encSecret = RootHerald::JsonGet(challenge, "encryptedSecret");
     if (deviceId.empty() || credBlob.empty() || encSecret.empty()) {
-        RH_LOG_WARN("[enroll-complete] challenge missing deviceId/credentialBlob/encryptedSecret\n");
-        return RH_PROTO_ERR_INVALID_PARAM;
+        return ROOTHERALD_ERR_INVALID_ARG;
     }
 
     std::vector<uint8_t> secret;
     HRESULT hr = g_enrollProvider->ActivateCredential(
         Base64Decode(credBlob), Base64Decode(encSecret), &secret);
     if (FAILED(hr) || secret.empty()) {
-        RH_LOG_WARN("[enroll-complete] ActivateCredential failed: 0x%08X\n", (unsigned)hr);
         g_enrollProvider->DeleteAk();
         g_enrollProvider.reset();
-        return RH_PROTO_ERR_ATTESTATION_FAILED;
+        return ROOTHERALD_ERR_ACTIVATION_FAILED;
     }
-    RH_LOG_WARN("[enroll-complete] ActivateCredential OK (%zu bytes)\n", secret.size());
 
     // Activation proved; evict to the persistent handle so later unprivileged
     // attestations can Quote against it.
     hr = g_enrollProvider->PersistAk();
     if (FAILED(hr)) {
-        RH_LOG_WARN("[enroll-complete] PersistAk failed: 0x%08X\n", (unsigned)hr);
         SecureZeroMemory(secret.data(), secret.size());
         g_enrollProvider.reset();
-        return RH_PROTO_ERR_ENROLLMENT_FAILED;
+        return ROOTHERALD_ERR_AK_FAILED;
     }
     g_enrollProvider.reset();
 
@@ -474,11 +453,10 @@ extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldResult RootHeraldEnro
     SecureZeroMemory(secret.data(), secret.size());
 
     char* buffer = (char*)malloc(json.size() + 1);
-    if (!buffer) return RH_PROTO_ERR_INTERNAL;
+    if (!buffer) return ROOTHERALD_ERR_INTERNAL;
     memcpy(buffer, json.c_str(), json.size() + 1);
     *out_activate_json = buffer;
-    RH_LOG_WARN("[enroll-complete] complete (deviceId=%s)\n", deviceId.c_str());
-    return RH_PROTO_OK;
+    return ROOTHERALD_OK;
 }
 
 /* Null unless a persisted AK is present. The AK lives at a persistent handle
@@ -494,7 +472,7 @@ static std::unique_ptr<RootHerald::TbsKeyProvider> SelectEnrolledProvider()
 /* Produces exactly the object POST /api/v1/attestations/verify expects in its
  * `evidence` field. No network call, no key. On failure out_reason carries a
  * short human-readable cause. */
-static RootHeraldResult CollectEvidenceFields(
+static RootHeraldStatus CollectEvidenceFields(
     _In_z_ const char* nonce_b64,
     _Inout_ std::map<std::string, std::string>* out_fields,
     _Inout_ std::string* out_reason)
@@ -506,30 +484,26 @@ static RootHeraldResult CollectEvidenceFields(
     // eviction-tolerant auto-recovery re-enroll and retry.
     auto provider = SelectEnrolledProvider();
     if (!provider) {
-        RH_LOG_WARN("[collect] no enrolled AK -- not enrolled\n");
         *out_reason = "Not enrolled";
-        return RH_PROTO_ERR_NOT_ENROLLED;
+        return ROOTHERALD_ERR_NOT_ENROLLED;
     }
-    RH_LOG_WARN("[collect] using %s backend\n", provider->ModeName());
     uint32_t akHandle = provider->GetQuoteHandle();
     if (!akHandle) {
-        RH_LOG_WARN("[collect] could not resolve AK quote handle (mode=%s)\n", provider->ModeName());
         *out_reason = "AK handle unavailable";
-        return RH_PROTO_ERR_ATTESTATION_FAILED;
+        return ROOTHERALD_ERR_AK_FAILED;
     }
 
     RootHerald::TpmCommands tpmCmd;
     HRESULT hr = tpmCmd.Open();
     if (FAILED(hr)) {
-        RH_LOG_WARN("[collect] TBS context open failed: 0x%08X\n", (unsigned)hr);
         *out_reason = "TPM unavailable";
-        return RH_PROTO_ERR_NO_TPM;
+        return ROOTHERALD_ERR_TPM_UNAVAILABLE;
     }
 
     auto nonce = Base64Decode(std::string(nonce_b64));
     if (nonce.empty()) {
         *out_reason = "Invalid nonce";
-        return RH_PROTO_ERR_INVALID_PARAM;
+        return ROOTHERALD_ERR_INVALID_ARG;
     }
 
     std::vector<uint32_t> pcrs = {0, 1, 2, 3, 4, 7};
@@ -539,9 +513,8 @@ static RootHeraldResult CollectEvidenceFields(
         std::vector<uint8_t> pcrValue;
         hr = tpmCmd.PcrRead(index, &pcrValue);
         if (FAILED(hr) || pcrValue.empty()) {
-            RH_LOG_WARN("[collect] PcrRead(%u) failed: 0x%08X -- aborting\n", index, (unsigned)hr);
             *out_reason = "PCR read failed";
-            return RH_PROTO_ERR_ATTESTATION_FAILED;
+            return ROOTHERALD_ERR_QUOTE_FAILED;
         }
         if (!first) pcrValuesJson += ",";
         first = false;
@@ -555,9 +528,8 @@ static RootHeraldResult CollectEvidenceFields(
     std::vector<uint8_t> quoted, signature;
     hr = tpmCmd.Quote(akHandle, nonce, pcrs, &quoted, &signature);
     if (FAILED(hr)) {
-        RH_LOG_WARN("[collect] TPM2_Quote failed: 0x%08X\n", (unsigned)hr);
         *out_reason = "Quote failed";
-        return RH_PROTO_ERR_ATTESTATION_FAILED;
+        return ROOTHERALD_ERR_QUOTE_FAILED;
     }
     std::string quoteJson = RootHerald::JsonBuild({
         {"quoted",    Base64Encode(quoted.data(), quoted.size())},
@@ -633,34 +605,32 @@ static RootHeraldResult CollectEvidenceFields(
     // An unbound session leaves DeviceId null at challenge time, so derive it
     // from the EK the same way the server does and let it resolve to this
     // device. /verify requires a DeviceId naming an enrolled device.
-    std::string deviceId = g_deviceId;
-    if (deviceId.empty()) deviceId = DeriveLocalDeviceId();
+    std::string deviceId = DeriveLocalDeviceId();
     if (!deviceId.empty()) (*out_fields)["deviceId"] = deviceId;
 
-    return RH_PROTO_OK;
+    return ROOTHERALD_OK;
 }
 
-extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldResult RootHeraldCollectEvidence(
+extern "C" _Use_decl_annotations_ ROOTHERALD_API RootHeraldStatus RootHeraldCollectEvidence(
     const char* nonce_b64, char** out_evidence_json)
 {
     if (!nonce_b64 || !out_evidence_json)
-        return RH_PROTO_ERR_INVALID_PARAM;
+        return ROOTHERALD_ERR_INVALID_ARG;
     *out_evidence_json = nullptr;
 
     std::map<std::string, std::string> fields;
     std::string reason;
-    RootHeraldResult result = CollectEvidenceFields(nonce_b64, &fields, &reason);
-    if (result != RH_PROTO_OK) {
-        RH_LOG_WARN("[collect-evidence] failed: %s\n", reason.c_str());
+    RootHeraldStatus result = CollectEvidenceFields(nonce_b64, &fields, &reason);
+    if (result != ROOTHERALD_OK) {
         return result;
     }
 
     std::string json = RootHerald::JsonBuild(fields);
     char* buffer = (char*)malloc(json.size() + 1);
-    if (!buffer) return RH_PROTO_ERR_INTERNAL;
+    if (!buffer) return ROOTHERALD_ERR_INTERNAL;
     memcpy(buffer, json.c_str(), json.size() + 1);
     *out_evidence_json = buffer;
-    return RH_PROTO_OK;
+    return ROOTHERALD_OK;
 }
 
 extern "C" _Use_decl_annotations_ ROOTHERALD_API void RootHeraldFreeEvidence(char* evidence_json)
@@ -668,52 +638,22 @@ extern "C" _Use_decl_annotations_ ROOTHERALD_API void RootHeraldFreeEvidence(cha
     free(evidence_json);
 }
 
-_Use_decl_annotations_
-void RootHeraldSetDeviceId(const char* device_id)
-{
-    if (device_id) g_deviceId = device_id;
-    else g_deviceId.clear();
-}
-
-_Use_decl_annotations_
-RootHeraldResult RootHeraldGetStatus(RootHeraldDeviceStatus* out_status)
-{
-    if (!out_status)
-        return RH_PROTO_ERR_INVALID_PARAM;
-    memset(out_status, 0, sizeof(RootHeraldDeviceStatus));
-    strncpy_s(out_status->platform, "windows", _TRUNCATE);
-
-    RootHerald::TpmPcp pcp;
-    out_status->has_tpm = pcp.IsAvailable() ? 1 : 0;
-    out_status->is_enrolled = IsAkPersisted() ? 1 : 0;
-
-    // device_id is derivable from the live TPM without an enroll, and callers
-    // expect it populated whenever has_tpm is 1. Best-effort: an empty id
-    // beats failing the status call.
-    if (out_status->has_tpm) {
-        try {
-            auto deviceId = DeriveLocalDeviceId();
-            if (!deviceId.empty())
-                strncpy_s(out_status->device_id, deviceId.c_str(), _TRUNCATE);
-        } catch (...) {
-        }
-    }
-    return RH_PROTO_OK;
-}
-
 /* Local-only posture snapshot. Never touches the network; detail_json mirrors
  * the secureBootChain fields the collect flow serializes, minus anything
  * network-derived. */
-extern "C" _Use_decl_annotations_ RootHeraldResult RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture)
+extern "C" _Use_decl_annotations_ RootHeraldStatus RootHeraldCollectLocalPosture(RootHeraldPosture* out_posture)
 {
     if (!out_posture)
-        return RH_PROTO_ERR_INVALID_PARAM;
+        return ROOTHERALD_ERR_INVALID_ARG;
     memset(out_posture, 0, sizeof(RootHeraldPosture));
+    strncpy_s(out_posture->platform_name, "windows", _TRUNCATE);
 
     // -1 is "undetermined"/"unavailable" until the event log says otherwise.
     out_posture->secure_boot = -1;
     out_posture->oem_keyed = -1;
     out_posture->boot_log_measurements = -1;
+    // Stays -1: nothing cross-references measured digests against dbx yet.
+    // See the field comment in rootherald.h.
     out_posture->boot_log_revoked = -1;
 
     RootHerald::TpmPcp pcp;
@@ -728,6 +668,7 @@ extern "C" _Use_decl_annotations_ RootHeraldResult RootHeraldCollectLocalPosture
             auto deviceId = DeriveLocalDeviceId();
             if (!deviceId.empty())
                 strncpy_s(out_posture->device_id, deviceId.c_str(), _TRUNCATE);
+
         } catch (...) {
         }
     }
@@ -765,5 +706,5 @@ extern "C" _Use_decl_annotations_ RootHeraldResult RootHeraldCollectLocalPosture
 
     auto detailJson = RootHerald::JsonBuild(detail);
     strncpy_s(out_posture->detail_json, detailJson.c_str(), _TRUNCATE);
-    return RH_PROTO_OK;
+    return ROOTHERALD_OK;
 }

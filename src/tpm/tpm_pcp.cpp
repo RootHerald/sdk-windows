@@ -1,6 +1,5 @@
 #include "tpm_pcp.h"
 
-#include "log.h"
 #include "win_status.h"
 
 namespace RootHerald {
@@ -14,7 +13,6 @@ bool TpmPcp::IsAvailable() const
     UniqueNcryptProvider probe;
     SECURITY_STATUS status = NCryptOpenStorageProvider(probe.Put(), PCP_PROVIDER, 0);
     if (FAILED(status)) {
-        RH_LOG_DEBUG("[pcp] NCryptOpenStorageProvider: 0x%08X\n", (unsigned)status);
         return false;
     }
     return true;
@@ -26,7 +24,6 @@ HRESULT TpmPcp::Open()
 
     SECURITY_STATUS status = NCryptOpenStorageProvider(_provider.Put(), PCP_PROVIDER, 0);
     if (FAILED(status)) {
-        RH_LOG_WARN("[pcp] NCryptOpenStorageProvider failed: 0x%08X\n", (unsigned)status);
         return HrFromSecurityStatus(status);
     }
     return S_OK;
@@ -47,7 +44,6 @@ HRESULT TpmPcp::ReadProperty(PCWSTR property, std::vector<uint8_t>* out_value)
     SECURITY_STATUS status =
         NCryptGetProperty(_provider.Get(), property, nullptr, 0, &size, 0);
     if (FAILED(status)) {
-        RH_LOG_WARN("[pcp] NCryptGetProperty(%S) size query failed: 0x%08X\n", property, (unsigned)status);
         return HrFromSecurityStatus(status);
     }
     if (size == 0) return RH_E_MALFORMED_RESPONSE;
@@ -55,7 +51,6 @@ HRESULT TpmPcp::ReadProperty(PCWSTR property, std::vector<uint8_t>* out_value)
     std::vector<uint8_t> value(size);
     status = NCryptGetProperty(_provider.Get(), property, value.data(), size, &size, 0);
     if (FAILED(status)) {
-        RH_LOG_WARN("[pcp] NCryptGetProperty(%S) failed: 0x%08X\n", property, (unsigned)status);
         return HrFromSecurityStatus(status);
     }
 

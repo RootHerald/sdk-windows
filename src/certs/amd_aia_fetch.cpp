@@ -9,7 +9,6 @@
 #include <string>
 
 #include "http_winhttp.h"
-#include "log.h"
 #include "unique_handle.h"
 
 #pragma comment(lib, "bcrypt.lib")
@@ -92,17 +91,13 @@ std::vector<uint8_t> FetchAmdAiaEkCert(const std::vector<uint8_t>& ekPubModulus)
 
     uint8_t digest[32] = {};
     if (!Sha256(ekPubModulus.data(), ekPubModulus.size(), digest)) {
-        RH_LOG_WARN("[amd-aia] SHA-256 of modulus failed\n");
         return {};
     }
 
     std::string url = "https://ftpm.amd.com/pki/aia/" + HexLower(digest, sizeof(digest));
 
-    RH_LOG_WARN("[amd-aia] GET %s\n", url.c_str());
     HttpResponse response = HttpGet(url);
     if (response.statusCode != 200) {
-        RH_LOG_WARN("[amd-aia] HTTP %d (body=%zu bytes)\n",
-                    response.statusCode, response.body.size());
         return {};
     }
 

@@ -6,6 +6,92 @@ contract; this file documents how it got there.
 The C ABI is identical across `sdk-windows`, `sdk-linux` and `sdk-macos`, and CI
 fails on drift, so every entry below applies to all three unless stated otherwise.
 
+## 5.0 — BREAKING
+
+Consumers must recompile. Nothing on the wire changed. Thirteen exported symbols
+become ten, and the status enum stops describing work no platform does.
+
+**Removed — all logging.**
+`RootHerald_SetLogCallback`, `RootHerald_SetLogLevel`, `RootHeraldLogLevel`,
+`RootHeraldLogCallback` and the internal shim behind them. 99 call sites across the
+three repos went with them, and with those the string literals they compiled into an
+archive that ends up inside a stranger's signed binary.
+
+The surface was not carrying its weight. 91 of the 99 sites logged at `WARN`, one at
+`ERROR`, and **none** at `INFO` or `TRACE` — so a five-level filter had one level to
+filter, and both shipping `windows-host` binaries were setting `INFO`, a level nothing
+logged at. What replaced it is a status enum granular enough that a caller can log the
+failure themselves, in their own stack, keyed to a documented symbol.
+
+**Removed — `RootHeraldClient_SetApplicationId`.**
+It advertised "a logical application id surfaced in audit logs and per-application
+policy." The entire implementation was a `strdup` into the client struct; nothing
+ever read it back, on any platform, and `ApplicationId` appears nowhere in the
+server. It could not have been a policy input in any case — the value is an
+unauthenticated self-declaration, so a caller wanting another application's policy
+would simply claim to be it.
+
+**Removed — `RootHeraldClient_GetDeviceInfo` and `RootHeraldDeviceInfo`.**
+Merged into `CollectPosture`, which on every platform already performed a strict
+superset of the same work — the same functions in the same order, then more — and
+returned a strict superset of the same fields. The one field only `GetDeviceInfo`
+carried, `platform_name`, moves onto `RootHeraldPosture`. It was a compile-time
+constant, not something the extra call went and discovered.
+
+**Changed — the status enum now names actions, not layers.**
+`ERR_NETWORK` (3) and `ERR_QUOTA_EXCEEDED` (5) are gone: neither had a single
+producer anywhere, both describing the direct-POST network client 3.0 deleted.
+`ERR_SERVER` (4) is gone because it was worse than dead — it was reachable, and it
+reported *local* TPM and crypto failures as "the server returned an error", sending
+integrators to debug the wrong system. `windows-host` had already written a
+workaround translating it back to the truth.
+
+In their place, five codes that each name a different next action:
+
+| Code | Means | Do |
+|---|---|---|
+| `ERR_EK_READ_FAILED` (8) | TPM present, EK unreadable | Check the resource manager, permissions, driver |
+| `ERR_AK_FAILED` (9) | AK create/load/persist failed | Retry enrollment |
+| `ERR_ACTIVATION_FAILED` (10) | Challenge could not be consumed | Restart from `EnrollBegin` — it is single-use and now spent |
+| `ERR_QUOTE_FAILED` (11) | PCR read or quote failed | Retry the attestation; do **not** re-enroll |
+| `ERR_ENTITLEMENT_MISSING` (12) | Host binary lacks the keychain entitlement | Fix code signing (macOS/iOS) |
+
+3, 4 and 5 are **not reused**. A consumer built against an older header must fail to
+compile rather than silently re-map onto a new meaning.
+
+`RootHerald_ErrorString` stays. It is a convenience for a `printf` during integration
+and for a CI harness's failure output, not the documentation — the per-code
+cause-and-remedy reference is on the developer portal, keyed by symbol rather than by
+number.
+
+**Changed — the driver returns `RootHeraldStatus` directly (Windows).**
+The internal `RootHeraldResult` / `RH_PROTO_ERR_*` vocabulary is gone. It existed so
+the driver could speak its own error language and the facade could translate once, but
+it collapsed twice: an `HRESULT` became a coarse `RH_PROTO_ERR_*`, which became a
+coarser public status. Nine distinct TPM failures arrived at the caller as "internal
+library error". A failure is now named once, where it happens.
+
+**Documented — `protocol.h` covers all three ceremonies.**
+It described only the TPM ceremony while claiming to be the contract shared by all
+three SDKs, so an integrator writing a cross-platform relay against it got macOS
+wrong: the fields it named (`credentialBlob`, `encryptedSecret`, `decryptedSecret`)
+do not exist there. It is now an envelope plus per-platform variants — TPM 2.0, Apple
+Secure Enclave, and Apple App Attest — with the discriminator and the anti-downgrade
+rule stated once.
+
+**Noted — `boot_log_revoked` is not computed.**
+It has always reported `-1`. The header previously implied the data was merely
+unavailable; in fact nothing cross-references measured digests against the dbx
+revocation list, and the dbx *list size* that is known is a property of the firmware
+rather than a finding about the device. The field stays — consumers render it and
+degrade correctly on `-1` — and the header now says plainly that it is uncomputed.
+
+**Removed — dead internals (Windows).**
+`RootHeraldGetStatus`, `RootHeraldDeviceStatus`, `RootHeraldSetDeviceId` and the
+`g_deviceId` override it wrote to. Nothing set the override, so the read always fell
+through to `DeriveLocalDeviceId()`. `client_internal.h` also stopped claiming the
+native messaging host calls across that boundary; it links only the public ABI.
+
 ## 4.0 — BREAKING
 
 Consumers must recompile. Nothing on the wire changed; this is a surface removal.

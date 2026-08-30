@@ -52,7 +52,6 @@ set(RH_LIB_SOURCES
     src/certs/amd_aia_fetch.cpp
     src/certs/win_cert_store_intermediates.cpp
     src/transport/http_winhttp.cpp
-    src/internal/log.cpp
 )
 
 set(RH_INCLUDE_DIRS
