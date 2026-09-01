@@ -616,9 +616,9 @@ HRESULT TpmCommands::EvictControl(uint32_t transientHandle, uint32_t persistentH
 }
 
 _Use_decl_annotations_
-HRESULT TpmCommands::ReadNvCertificate(uint32_t nvIndex, std::vector<uint8_t>* out_certificate)
+HRESULT TpmCommands::ReadNvData(uint32_t nvIndex, std::vector<uint8_t>* out_data)
 {
-    out_certificate->clear();
+    out_data->clear();
 
     // TPM2_NV_ReadPublic first, to discover dataSize.
     // Response: header | TPM2B_NV_PUBLIC | TPM2B_NAME, where TPMS_NV_PUBLIC is
@@ -656,7 +656,7 @@ HRESULT TpmCommands::ReadNvCertificate(uint32_t nvIndex, std::vector<uint8_t>* o
     // TPM 2.0 floor is 512; querying TPM_PT_NV_BUFFER_MAX is overkill here).
     const uint16_t CHUNK = 1024;
     uint16_t readOffset = 0;
-    out_certificate->reserve(dataSize);
+    out_data->reserve(dataSize);
     while (readOffset < dataSize) {
         uint16_t want = (uint16_t)((dataSize - readOffset) > CHUNK
                                    ? CHUNK
@@ -673,50 +673,105 @@ HRESULT TpmCommands::ReadNvCertificate(uint32_t nvIndex, std::vector<uint8_t>* o
         std::vector<uint8_t> readResp;
         hr = SendCommand(&readCmd, &readResp);
         if (FAILED(hr)) {
-            out_certificate->clear();
+            out_data->clear();
             return hr;
         }
         if (readResp.size() < 10) {
-            out_certificate->clear();
+            out_data->clear();
             return RH_E_MALFORMED_RESPONSE;
         }
         uint32_t readRc = ReadU32(readResp.data() + 6);
         if (readRc != TPM2_RC_SUCCESS) {
-            out_certificate->clear();
+            out_data->clear();
             return HrFromTpmRc(readRc);
         }
 
         // header(10) | parameterSize(4) | TPM2B_MAX_NV_BUFFER | auth area
         size_t bufferOffset = 10 + 4;
         if (bufferOffset + 2 > readResp.size()) {
-            out_certificate->clear();
+            out_data->clear();
             return RH_E_MALFORMED_RESPONSE;
         }
         uint16_t got = ReadU16(readResp.data() + bufferOffset);
         bufferOffset += 2;
         if (got == 0 || bufferOffset + got > readResp.size()) {
-            out_certificate->clear();
+            out_data->clear();
             return RH_E_MALFORMED_RESPONSE;
         }
-        out_certificate->insert(out_certificate->end(),
+        out_data->insert(out_data->end(),
                                 readResp.data() + bufferOffset,
                                 readResp.data() + bufferOffset + got);
         readOffset = (uint16_t)(readOffset + got);
     }
 
-    return out_certificate->empty() ? RH_E_MALFORMED_RESPONSE : S_OK;
+    return out_data->empty() ? RH_E_MALFORMED_RESPONSE : S_OK;
 }
+
+namespace {
+
+/* Byte length of the DER object starting at `offset`, or 0 when the bytes there
+ * are not a well-formed SEQUENCE that fits inside `data`. Definite-length only:
+ * a certificate is always definite-length DER, so refusing the indefinite form
+ * keeps a malformed buffer from being walked as though it were a chain. */
+size_t DerObjectSize(const std::vector<uint8_t>& data, size_t offset)
+{
+    if (offset + 2 > data.size() || data[offset] != 0x30) return 0;
+
+    const uint8_t lengthByte = data[offset + 1];
+    if ((lengthByte & 0x80) == 0) {
+        const size_t total = 2u + lengthByte;
+        return offset + total <= data.size() ? total : 0;
+    }
+
+    const size_t lengthBytes = lengthByte & 0x7Fu;
+    if (lengthBytes == 0 || lengthBytes > 4) return 0;
+    if (offset + 2 + lengthBytes > data.size()) return 0;
+
+    size_t length = 0;
+    for (size_t i = 0; i < lengthBytes; ++i) {
+        length = (length << 8) | data[offset + 2 + i];
+    }
+
+    const size_t total = 2 + lengthBytes + length;
+    return offset + total <= data.size() ? total : 0;
+}
+
+} // namespace
 
 _Use_decl_annotations_
 void TpmCommands::ReadIntelOdcaIntermediates(std::vector<std::vector<uint8_t>>* certificates)
 {
-    // In practice 1-3 intermediates are present; 16 bounds the walk well clear
-    // of a pathological NV layout.
+    // Intel writes the on-die chain as ONE byte stream and splits it across as
+    // many NV indices as it needs, so a certificate straddles the boundary
+    // whenever the stream reaches an index's capacity mid-certificate. Reading
+    // each index as a certificate yields fragments that parse as nothing, which
+    // is why the whole range is concatenated before it is cut.
+    //
+    // Measured on an Intel Core Ultra 9 185H (Meteor Lake): 0x01C00100 holds
+    // 2048 bytes and 0x01C00101 holds 124, carrying three certificates of 806,
+    // 677 and 689 bytes. The third begins at 1483 and runs through the 2048-byte
+    // index boundary.
+    std::vector<uint8_t> stream;
     for (uint32_t i = 0; i < 16; ++i) {
-        std::vector<uint8_t> certificate;
-        if (SUCCEEDED(ReadNvCertificate(0x01C00100u + i, &certificate)) && !certificate.empty()) {
-            certificates->push_back(std::move(certificate));
+        std::vector<uint8_t> slot;
+        if (SUCCEEDED(ReadNvData(0x01C00100u + i, &slot)) && !slot.empty()) {
+            stream.insert(stream.end(), slot.begin(), slot.end());
         }
+    }
+    if (stream.empty()) return;
+
+    // Real chains are 2-3 deep; 8 bounds a pathological NV layout.
+    constexpr size_t MAX_CERTIFICATES = 8;
+    size_t offset = 0;
+    while (offset < stream.size() && certificates->size() < MAX_CERTIFICATES) {
+        const size_t size = DerObjectSize(stream, offset);
+        // A chain that does not exactly fill its last index is padded, so the
+        // first byte that does not open a SEQUENCE ends the chain rather than
+        // failing it.
+        if (size == 0) break;
+        certificates->emplace_back(stream.begin() + offset,
+                                   stream.begin() + offset + size);
+        offset += size;
     }
 }
 
