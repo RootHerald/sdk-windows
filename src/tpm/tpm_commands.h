@@ -72,13 +72,18 @@ public:
 
     bool IsPersistentPresent(uint32_t persistentHandle);
 
-    /* nvIndex must be a defined NV handle (0x01xxxxxx). */
+    /* Raw contents of one NV index. nvIndex must be a defined NV handle
+     * (0x01xxxxxx). This is NOT a certificate: Intel chunks its on-die chain
+     * across indices, so an index holds an arbitrary slice of a byte stream and
+     * a certificate routinely straddles the boundary between two. */
     _Success_(return == S_OK)
-    HRESULT ReadNvCertificate(uint32_t nvIndex, _Out_ std::vector<uint8_t>* out_certificate);
+    HRESULT ReadNvData(uint32_t nvIndex, _Out_ std::vector<uint8_t>* out_data);
 
     /* Appends every DER certificate present in the Intel PTT on-die CA range
      * 0x01C00100..0x01C0010F, in NV-handle order. Undefined handles are skipped,
-     * which is why an absent chain is not reported as a failure. */
+     * which is why an absent chain is not reported as a failure. The indices are
+     * concatenated before parsing, because the boundary between them falls
+     * wherever the stream happens to reach an index's capacity. */
     void ReadIntelOdcaIntermediates(_Inout_ std::vector<std::vector<uint8_t>>* certificates);
 
 private:
