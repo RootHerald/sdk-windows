@@ -182,10 +182,10 @@ ROOTHERALD_API void RootHeraldClient_Destroy(_In_opt_ RootHeraldClient* client);
  * attestation key this device just minted.
  *
  *   1. EnrollBegin  -> reads the EK, mints an AK, emits the
- *      POST /api/v1/devices/enroll body. Backend relays it; Root Herald returns
+ *      POST /api/v1/attest/enroll body. Backend relays it; Root Herald returns
  *      {deviceId, credentialBlob, encryptedSecret}.
  *   2. EnrollComplete(challenge) -> runs TPM2_ActivateCredential over it,
- *      PERSISTS the AK, and emits the POST /api/v1/devices/activate body.
+ *      PERSISTS the AK, and emits the POST /api/v1/attest/activate body.
  *
  * Neither call opens a socket or consults a key.
  *
@@ -236,7 +236,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
  *
  *   1. (here)             collect the evidence blob — no key, no verdict.
  *   2. (customer backend) relay it server->server with rh_sk_ to
- *                         POST /api/v1/attestations/verify.
+ *                         POST /api/v1/attest/verify.
  *   3. (Root Herald)      appraise and return a verdict the backend ENFORCES.
  *
  * Never compile an rh_sk_ secret into this library — putting it on the device
@@ -252,7 +252,7 @@ ROOTHERALD_API RootHeraldStatus RootHeraldClient_CollectPosture(
  * Whether a log was found is reported by CollectPosture.boot_log_measurements.
  */
 
-/* nonce_b64: the backend's challenge nonce from POST /api/v1/attestations/challenge.
+/* nonce_b64: the backend's challenge nonce from POST /api/v1/attest/challenge.
  * The quote is taken OVER it, so freshness is bound inside the signature.
  * out_evidence_json: exactly the object /attestations/verify expects in its
  * `evidence` field. Caller owns; free with RootHeraldClient_FreeEvidence.
