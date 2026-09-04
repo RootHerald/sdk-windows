@@ -469,7 +469,7 @@ static std::unique_ptr<RootHerald::TbsKeyProvider> SelectEnrolledProvider()
     return nullptr;
 }
 
-/* Produces exactly the object POST /api/v1/attestations/verify expects in its
+/* Produces exactly the object POST /api/v1/attest/verify expects in its
  * `evidence` field. No network call, no key. On failure out_reason carries a
  * short human-readable cause. */
 static RootHeraldStatus CollectEvidenceFields(

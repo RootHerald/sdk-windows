@@ -26,9 +26,9 @@
  * Three endpoints. The CLIENT never calls them; it emits bodies the embedder's
  * BACKEND relays, authenticated with the backend's rh_sk_ secret.
  *
- *   POST /api/v1/devices/enroll        leg 1 of enrollment
- *   POST /api/v1/devices/activate      leg 2 of enrollment
- *   POST /api/v1/attestations/verify   every attestation thereafter
+ *   POST /api/v1/attest/enroll        leg 1 of enrollment
+ *   POST /api/v1/attest/activate      leg 2 of enrollment
+ *   POST /api/v1/attest/verify   every attestation thereafter
  *
  * `platform` on the enroll body is the discriminator. It is recorded on the
  * device row, and ACTIVATION decides which proof to demand from the RECORDED
@@ -36,7 +36,7 @@
  * device onto a weaker ceremony by reshaping its own JSON.
  *
  * The nonce for /attestations/verify comes from
- * POST /api/v1/attestations/challenge, which is device-agnostic: it takes a
+ * POST /api/v1/attest/challenge, which is device-agnostic: it takes a
  * tenant and returns a fresh single-use nonce. It does not need to know which
  * device will answer.
  */
